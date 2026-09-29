@@ -1,4 +1,4 @@
-```python
+
 import os
 import time
 import ccxt
@@ -22,14 +22,18 @@ SYMBOL = "SOL/USDT"
 TF = "5m"
 TF_MS = 5 * 60 * 1000
 
-# How often the bot checks the market
+# Check market every 15 seconds
 POLL = 15
 
-# GitHub Actions / runner safety limit
+# GitHub Actions safe runtime
 RUN_SECONDS = 350 * 60
 
-# Detailed report
+# Detailed report every 10 minutes
 REPORT_INTERVAL = 10 * 60
+
+# External data refresh
+EXTERNAL_DATA_INTERVAL = 60
+NEWS_INTERVAL = 10 * 60
 
 # Signal filters
 MIN_ATR_PCT = 0.0025
@@ -40,13 +44,9 @@ SL_MULT = 1.0
 TP1_MULT = 1.5
 TP2_MULT = 2.5
 
-# Minimum confirmation score
+# Minimum score required
 MIN_LONG_SCORE = 8
 MIN_SHORT_SCORE = 8
-
-# External data refresh intervals
-EXTERNAL_DATA_INTERVAL = 60
-NEWS_INTERVAL = 10 * 60
 
 
 # ============================================================
@@ -66,7 +66,7 @@ exchange = ccxt.okx({
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "SOL-Market-Bot/1.0"
+    "User-Agent": "SOL-USDT-Market-Bot/1.0"
 })
 
 
@@ -77,12 +77,12 @@ session.headers.update({
 def send(msg):
 
     if not TOKEN or not CHAT_ID:
-        print("Telegram credentials are missing.")
+        print("ERROR: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is missing.")
         return False
 
     try:
 
-        r = session.post(
+        response = session.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
             data={
                 "chat_id": CHAT_ID,
@@ -91,14 +91,15 @@ def send(msg):
             timeout=15
         )
 
-        print("Telegram:", r.status_code)
+        print("Telegram:", response.status_code)
 
-        return r.ok
+        if not response.ok:
+            print("Telegram response:", response.text[:500])
+
+        return response.ok
 
     except Exception:
-
         traceback.print_exc()
-
         return False
 
 
@@ -109,11 +110,8 @@ def send(msg):
 def safe_float(value, default=None):
 
     try:
-
         return float(value)
-
     except Exception:
-
         return default
 
 
@@ -123,17 +121,16 @@ def fmt(value, decimals=3):
         return "N/A"
 
     try:
-
         return f"{float(value):.{decimals}f}"
-
     except Exception:
-
         return "N/A"
 
 
 def now_utc():
 
-    return datetime.now(timezone.utc).strftime(
+    return datetime.now(
+        timezone.utc
+    ).strftime(
         "%Y-%m-%d %H:%M:%S UTC"
     )
 
@@ -142,7 +139,11 @@ def now_utc():
 # GET OHLCV
 # ============================================================
 
-def get_df(symbol=SYMBOL, timeframe=TF, limit=300):
+def get_df(
+    symbol=SYMBOL,
+    timeframe=TF,
+    limit=300
+):
 
     raw = exchange.fetch_ohlcv(
         symbol,
@@ -150,7 +151,7 @@ def get_df(symbol=SYMBOL, timeframe=TF, limit=300):
         limit=limit
     )
 
-    df = pd.DataFrame(
+    return pd.DataFrame(
         raw,
         columns=[
             "time",
@@ -162,8 +163,6 @@ def get_df(symbol=SYMBOL, timeframe=TF, limit=300):
         ]
     )
 
-    return df
-
 
 # ============================================================
 # INDICATORS
@@ -174,30 +173,30 @@ def add_indicators(df):
     df = df.copy()
 
     # --------------------------------------------------------
-    # EMA
+    # EMA 9 / 21 / 50
     # --------------------------------------------------------
 
-    df["ema_fast"] = df.close.ewm(
+    df["ema_fast"] = df["close"].ewm(
         span=9,
         adjust=False
     ).mean()
 
-    df["ema_slow"] = df.close.ewm(
+    df["ema_slow"] = df["close"].ewm(
         span=21,
         adjust=False
     ).mean()
 
-    df["ema_trend"] = df.close.ewm(
+    df["ema_trend"] = df["close"].ewm(
         span=50,
         adjust=False
     ).mean()
 
 
     # --------------------------------------------------------
-    # RSI
+    # RSI 14
     # --------------------------------------------------------
 
-    delta = df.close.diff()
+    delta = df["close"].diff()
 
     gain = delta.clip(
         lower=0
@@ -213,7 +212,12 @@ def add_indicators(df):
         adjust=False
     ).mean()
 
-    rs = gain / loss.replace(0, pd.NA)
+    loss = loss.replace(
+        0,
+        pd.NA
+    )
+
+    rs = gain / loss
 
     df["rsi"] = (
         100 -
@@ -225,17 +229,27 @@ def add_indicators(df):
 
 
     # --------------------------------------------------------
-    # ATR
+    # ATR 14
     # --------------------------------------------------------
 
     tr = pd.concat(
         [
-            df.high - df.low,
-            (df.high - df.close.shift()).abs(),
-            (df.low - df.close.shift()).abs()
+            df["high"] - df["low"],
+
+            (
+                df["high"] -
+                df["close"].shift()
+            ).abs(),
+
+            (
+                df["low"] -
+                df["close"].shift()
+            ).abs()
         ],
         axis=1
-    ).max(axis=1)
+    ).max(
+        axis=1
+    )
 
     df["atr"] = tr.ewm(
         alpha=1 / 14,
@@ -248,29 +262,33 @@ def add_indicators(df):
     # --------------------------------------------------------
 
     day = pd.to_datetime(
-        df.time,
+        df["time"],
         unit="ms"
     ).dt.date
 
     typical_price = (
-        df.high +
-        df.low +
-        df.close
+        df["high"] +
+        df["low"] +
+        df["close"]
     ) / 3
 
     cumulative_volume = (
-        df.volume
+        df["volume"]
         .groupby(day)
         .cumsum()
     )
 
     cumulative_pv = (
-        typical_price * df.volume
+        typical_price *
+        df["volume"]
     ).groupby(day).cumsum()
 
     df["vwap"] = (
         cumulative_pv /
-        cumulative_volume
+        cumulative_volume.replace(
+            0,
+            pd.NA
+        )
     )
 
 
@@ -279,14 +297,17 @@ def add_indicators(df):
     # --------------------------------------------------------
 
     df["vol_avg"] = (
-        df.volume
+        df["volume"]
         .rolling(20)
         .mean()
     )
 
     df["volume_ratio"] = (
-        df.volume /
-        df.vol_avg
+        df["volume"] /
+        df["vol_avg"].replace(
+            0,
+            pd.NA
+        )
     )
 
 
@@ -296,11 +317,11 @@ def add_indicators(df):
 
     df["change_pct"] = (
         (
-            df.close -
-            df.open
+            df["close"] -
+            df["open"]
         )
         /
-        df.open
+        df["open"]
     ) * 100
 
 
@@ -308,55 +329,58 @@ def add_indicators(df):
 
 
 # ============================================================
-# MULTI-TIMEFRAME ANALYSIS
+# TIMEFRAME STATUS
 # ============================================================
 
 def timeframe_status(df):
 
+    if df is None or len(df) < 60:
+        return "UNAVAILABLE"
+
     c = df.iloc[-2]
 
-    price = c.close
+    price = c["close"]
 
     if (
         price >
-        c.ema_fast >
-        c.ema_slow >
-        c.ema_trend
+        c["ema_fast"] >
+        c["ema_slow"] >
+        c["ema_trend"]
         and
-        price > c.vwap
+        price > c["vwap"]
     ):
-
         return "BULLISH"
 
     if (
         price <
-        c.ema_fast <
-        c.ema_slow <
-        c.ema_trend
+        c["ema_fast"] <
+        c["ema_slow"] <
+        c["ema_trend"]
         and
-        price < c.vwap
+        price < c["vwap"]
     ):
-
         return "BEARISH"
 
     if (
-        price > c.ema_slow
+        price > c["ema_slow"]
         and
-        price > c.ema_trend
+        price > c["ema_trend"]
     ):
-
         return "WEAK BULLISH"
 
     if (
-        price < c.ema_slow
+        price < c["ema_slow"]
         and
-        price < c.ema_trend
+        price < c["ema_trend"]
     ):
-
         return "WEAK BEARISH"
 
     return "NEUTRAL"
 
+
+# ============================================================
+# MULTI-TIMEFRAME
+# ============================================================
 
 def get_multi_timeframe():
 
@@ -373,23 +397,25 @@ def get_multi_timeframe():
 
         try:
 
-            df = add_indicators(
-                get_df(
-                    SYMBOL,
-                    timeframe,
-                    300
-                )
+            data = get_df(
+                SYMBOL,
+                timeframe,
+                300
+            )
+
+            data = add_indicators(
+                data
             )
 
             results[timeframe] = {
-                "status": timeframe_status(df),
-                "df": df
+                "status": timeframe_status(data),
+                "df": data
             }
 
         except Exception as e:
 
             print(
-                f"MTF error {timeframe}:",
+                f"MTF {timeframe} error:",
                 e
             )
 
@@ -407,27 +433,25 @@ def get_multi_timeframe():
 
 def market_structure(df):
 
-    recent = df.iloc[-21:-1]
-
-    if len(recent) < 20:
-
+    if len(df) < 22:
         return "UNKNOWN"
+
+    recent = df.iloc[-21:-1]
 
     first_half = recent.iloc[:10]
     second_half = recent.iloc[10:]
 
-    first_high = first_half.high.max()
-    second_high = second_half.high.max()
+    first_high = first_half["high"].max()
+    second_high = second_half["high"].max()
 
-    first_low = first_half.low.min()
-    second_low = second_half.low.min()
+    first_low = first_half["low"].min()
+    second_low = second_half["low"].min()
 
     if (
         second_high > first_high
         and
         second_low > first_low
     ):
-
         return "HH + HL / Bullish Structure"
 
     if (
@@ -435,7 +459,6 @@ def market_structure(df):
         and
         second_low < first_low
     ):
-
         return "LH + LL / Bearish Structure"
 
     return "Mixed / Range"
@@ -449,14 +472,18 @@ def get_support_resistance(df):
 
     recent = df.iloc[-50:-1]
 
-    support = recent.low.min()
-    resistance = recent.high.max()
+    if len(recent) == 0:
+        return None, None
+
+    support = recent["low"].min()
+
+    resistance = recent["high"].max()
 
     return support, resistance
 
 
 # ============================================================
-# BTC + CRYPTO MARKET CONTEXT
+# CRYPTO MARKET CONTEXT
 # ============================================================
 
 def get_crypto_context():
@@ -470,6 +497,10 @@ def get_crypto_context():
         "btc_dominance": None
     }
 
+    # --------------------------------------------------------
+    # BTC / SOL / ETH
+    # --------------------------------------------------------
+
     try:
 
         url = (
@@ -479,33 +510,54 @@ def get_crypto_context():
             "&include_24hr_change=true"
         )
 
-        data = session.get(
+        response = session.get(
             url,
             timeout=10
-        ).json()
+        )
+
+        data = response.json()
 
         result["btc_price"] = safe_float(
-            data["bitcoin"]["usd"]
+            data.get(
+                "bitcoin",
+                {}
+            ).get(
+                "usd"
+            )
         )
 
         result["btc_change"] = safe_float(
-            data["bitcoin"].get(
+            data.get(
+                "bitcoin",
+                {}
+            ).get(
                 "usd_24h_change"
             )
         )
 
         result["sol_price"] = safe_float(
-            data["solana"]["usd"]
+            data.get(
+                "solana",
+                {}
+            ).get(
+                "usd"
+            )
         )
 
         result["sol_change"] = safe_float(
-            data["solana"].get(
+            data.get(
+                "solana",
+                {}
+            ).get(
                 "usd_24h_change"
             )
         )
 
         result["eth_change"] = safe_float(
-            data["ethereum"].get(
+            data.get(
+                "ethereum",
+                {}
+            ).get(
                 "usd_24h_change"
             )
         )
@@ -519,18 +571,28 @@ def get_crypto_context():
 
 
     # --------------------------------------------------------
-    # Global market data
+    # BTC DOMINANCE
     # --------------------------------------------------------
 
     try:
 
-        data = session.get(
+        response = session.get(
             "https://api.coingecko.com/api/v3/global",
             timeout=10
-        ).json()
+        )
+
+        data = response.json()
 
         result["btc_dominance"] = safe_float(
-            data["data"]["market_cap_percentage"]["btc"]
+            data.get(
+                "data",
+                {}
+            ).get(
+                "market_cap_percentage",
+                {}
+            ).get(
+                "btc"
+            )
         )
 
     except Exception as e:
@@ -545,7 +607,7 @@ def get_crypto_context():
 
 
 # ============================================================
-# BINANCE FUTURES DATA
+# BINANCE FUTURES
 # ============================================================
 
 def get_binance_futures():
@@ -554,29 +616,33 @@ def get_binance_futures():
         "funding": None,
         "open_interest": None,
         "oi_change_pct": None,
-        "long_liquidation": 0,
-        "short_liquidation": 0
+        "long_liquidation": 0.0,
+        "short_liquidation": 0.0
     }
 
     symbol = "SOLUSDT"
 
 
     # --------------------------------------------------------
-    # Funding
+    # FUNDING
     # --------------------------------------------------------
 
     try:
 
-        data = session.get(
+        response = session.get(
             "https://fapi.binance.com/fapi/v1/premiumIndex",
             params={
                 "symbol": symbol
             },
             timeout=10
-        ).json()
+        )
+
+        data = response.json()
 
         result["funding"] = safe_float(
-            data.get("lastFundingRate")
+            data.get(
+                "lastFundingRate"
+            )
         )
 
     except Exception as e:
@@ -588,38 +654,42 @@ def get_binance_futures():
 
 
     # --------------------------------------------------------
-    # Open Interest
+    # OPEN INTEREST
     # --------------------------------------------------------
 
     try:
 
-        data = session.get(
+        response = session.get(
             "https://fapi.binance.com/fapi/v1/openInterest",
             params={
                 "symbol": symbol
             },
             timeout=10
-        ).json()
+        )
+
+        data = response.json()
 
         result["open_interest"] = safe_float(
-            data.get("openInterest")
+            data.get(
+                "openInterest"
+            )
         )
 
     except Exception as e:
 
         print(
-            "OI error:",
+            "Open interest error:",
             e
         )
 
 
     # --------------------------------------------------------
-    # OI historical change
+    # OI CHANGE
     # --------------------------------------------------------
 
     try:
 
-        data = session.get(
+        response = session.get(
             "https://fapi.binance.com/futures/data/openInterestHist",
             params={
                 "symbol": symbol,
@@ -627,9 +697,15 @@ def get_binance_futures():
                 "limit": 2
             },
             timeout=10
-        ).json()
+        )
 
-        if isinstance(data, list) and len(data) >= 2:
+        data = response.json()
+
+        if (
+            isinstance(data, list)
+            and
+            len(data) >= 2
+        ):
 
             old_oi = safe_float(
                 data[-2].get(
@@ -643,7 +719,11 @@ def get_binance_futures():
                 )
             )
 
-            if old_oi and new_oi:
+            if (
+                old_oi
+                and
+                new_oi
+            ):
 
                 result["oi_change_pct"] = (
                     (
@@ -657,65 +737,77 @@ def get_binance_futures():
     except Exception as e:
 
         print(
-            "Historical OI error:",
+            "OI history error:",
             e
         )
 
 
     # --------------------------------------------------------
-    # Liquidations
+    # LIQUIDATIONS
     # --------------------------------------------------------
 
     try:
 
-        data = session.get(
+        response = session.get(
             "https://fapi.binance.com/fapi/v1/allForceOrders",
             params={
                 "symbol": symbol,
                 "limit": 100
             },
             timeout=10
-        ).json()
+        )
+
+        data = response.json()
 
         if isinstance(data, list):
 
             one_hour_ago = (
-                int(time.time() * 1000)
+                int(
+                    time.time() * 1000
+                )
                 -
                 60 * 60 * 1000
             )
 
             for order in data:
 
-                order_time = order.get("time", 0)
+                order_time = order.get(
+                    "time",
+                    0
+                )
 
                 if order_time < one_hour_ago:
                     continue
 
-                qty = safe_float(
-                    order.get("origQty"),
+                quantity = safe_float(
+                    order.get(
+                        "origQty"
+                    ),
                     0
                 )
 
                 price = safe_float(
-                    order.get("price"),
+                    order.get(
+                        "price"
+                    ),
                     0
                 )
 
-                value = qty * price
+                value = (
+                    quantity *
+                    price
+                )
 
                 side = order.get(
                     "side"
                 )
 
-                # A forced SELL generally closes a LONG.
                 if side == "SELL":
 
                     result[
                         "long_liquidation"
                     ] += value
 
-                # A forced BUY generally closes a SHORT.
                 elif side == "BUY":
 
                     result[
@@ -734,10 +826,13 @@ def get_binance_futures():
 
 
 # ============================================================
-# SOLANA NETWORK DATA
+# SOLANA RPC
 # ============================================================
 
-def solana_rpc(method, params=None):
+def solana_rpc(
+    method,
+    params=None
+):
 
     try:
 
@@ -748,16 +843,15 @@ def solana_rpc(method, params=None):
         }
 
         if params is not None:
-
             payload["params"] = params
 
-        r = session.post(
+        response = session.post(
             "https://api.mainnet-beta.solana.com",
             json=payload,
             timeout=10
         )
 
-        return r.json()
+        return response.json()
 
     except Exception as e:
 
@@ -781,7 +875,7 @@ def get_solana_network():
 
 
     # --------------------------------------------------------
-    # Health
+    # HEALTH
     # --------------------------------------------------------
 
     try:
@@ -791,7 +885,6 @@ def get_solana_network():
         )
 
         if data:
-
             result["health"] = data.get(
                 "result"
             )
@@ -799,13 +892,13 @@ def get_solana_network():
     except Exception as e:
 
         print(
-            "Health error:",
+            "Solana health error:",
             e
         )
 
 
     # --------------------------------------------------------
-    # Epoch
+    # EPOCH
     # --------------------------------------------------------
 
     try:
@@ -814,16 +907,26 @@ def get_solana_network():
             "getEpochInfo"
         )
 
-        if data and data.get("result"):
+        if (
+            data
+            and
+            data.get("result")
+        ):
 
-            epoch_data = data["result"]
+            epoch_data = data[
+                "result"
+            ]
 
-            result["slot"] = epoch_data.get(
-                "absoluteSlot"
+            result["slot"] = (
+                epoch_data.get(
+                    "absoluteSlot"
+                )
             )
 
-            result["epoch"] = epoch_data.get(
-                "epoch"
+            result["epoch"] = (
+                epoch_data.get(
+                    "epoch"
+                )
             )
 
     except Exception as e:
@@ -835,7 +938,7 @@ def get_solana_network():
 
 
     # --------------------------------------------------------
-    # Network performance
+    # PERFORMANCE / TPS
     # --------------------------------------------------------
 
     try:
@@ -851,17 +954,29 @@ def get_solana_network():
             data.get("result")
         ):
 
-            sample = data["result"][0]
+            sample = data[
+                "result"
+            ][0]
 
-            transactions = sample.get(
-                "numTransactions"
+            transactions = safe_float(
+                sample.get(
+                    "numTransactions"
+                )
             )
 
-            seconds = sample.get(
-                "samplePeriodSecs"
+            seconds = safe_float(
+                sample.get(
+                    "samplePeriodSecs"
+                )
             )
 
-            if seconds:
+            if (
+                transactions is not None
+                and
+                seconds
+                and
+                seconds > 0
+            ):
 
                 result["tps"] = (
                     transactions /
@@ -888,6 +1003,7 @@ def get_solana_network():
 # ============================================================
 
 news_cache = []
+
 last_news_update = 0
 
 
@@ -896,12 +1012,15 @@ def get_news():
     global news_cache
     global last_news_update
 
-    now = time.time()
+    current_time = time.time()
 
     if (
         news_cache
         and
-        now - last_news_update < NEWS_INTERVAL
+        current_time -
+        last_news_update
+        <
+        NEWS_INTERVAL
     ):
 
         return news_cache
@@ -917,13 +1036,13 @@ def get_news():
             "&ceid=US:en"
         )
 
-        r = session.get(
+        response = session.get(
             url,
             timeout=10
         )
 
         root = ET.fromstring(
-            r.text
+            response.text
         )
 
         headlines = []
@@ -942,10 +1061,11 @@ def get_news():
                     title.strip()
                 )
 
-
         news_cache = headlines
 
-        last_news_update = now
+        last_news_update = (
+            current_time
+        )
 
         return news_cache
 
@@ -960,30 +1080,41 @@ def get_news():
 
 
 # ============================================================
-# ORIGINAL SIGNAL ENGINE
+# ORIGINAL SIGNAL
 # ============================================================
 
-def signal_at(df, i):
+def signal_at(
+    df,
+    i
+):
 
-    prev = df.iloc[i - 1]
+    if i < 1:
+        return None
+
+    prev = df.iloc[
+        i - 1
+    ]
 
     c = df.iloc[i]
 
 
     if (
-        pd.isna(c.vol_avg)
+        pd.isna(c["vol_avg"])
         or
-        pd.isna(c.vwap)
+        pd.isna(c["vwap"])
         or
-        pd.isna(c.rsi)
+        pd.isna(c["rsi"])
+        or
+        pd.isna(c["atr"])
     ):
 
         return None
 
 
-    # Volatility
+    # Volatility filter
     if (
-        c.atr / c.close
+        c["atr"] /
+        c["close"]
         <
         MIN_ATR_PCT
     ):
@@ -991,52 +1122,64 @@ def signal_at(df, i):
         return None
 
 
-    # Volume
+    # Volume filter
     if (
-        c.volume
+        c["volume"]
         <
         MIN_VOLUME_RATIO *
-        c.vol_avg
+        c["vol_avg"]
     ):
 
         return None
 
 
-    # EMA crossover
+    # Bullish crossover
     up = (
-        prev.ema_fast <= prev.ema_slow
+        prev["ema_fast"]
+        <=
+        prev["ema_slow"]
         and
-        c.ema_fast > c.ema_slow
+        c["ema_fast"]
+        >
+        c["ema_slow"]
     )
 
+
+    # Bearish crossover
     down = (
-        prev.ema_fast >= prev.ema_slow
+        prev["ema_fast"]
+        >=
+        prev["ema_slow"]
         and
-        c.ema_fast < c.ema_slow
+        c["ema_fast"]
+        <
+        c["ema_slow"]
     )
 
 
+    # LONG
     if (
         up
         and
-        c.close > c.vwap
+        c["close"] > c["vwap"]
         and
-        c.close > c.ema_trend
+        c["close"] > c["ema_trend"]
         and
-        50 < c.rsi < 70
+        50 < c["rsi"] < 70
     ):
 
         return "LONG"
 
 
+    # SHORT
     if (
         down
         and
-        c.close < c.vwap
+        c["close"] < c["vwap"]
         and
-        c.close < c.ema_trend
+        c["close"] < c["ema_trend"]
         and
-        30 < c.rsi < 50
+        30 < c["rsi"] < 50
     ):
 
         return "SHORT"
@@ -1049,7 +1192,12 @@ def signal_at(df, i):
 # ADVANCED SIGNAL SCORING
 # ============================================================
 
-def advanced_signal(df, mtf, crypto, futures):
+def advanced_signal(
+    df,
+    mtf,
+    crypto,
+    futures
+):
 
     c = df.iloc[-2]
 
@@ -1063,13 +1211,17 @@ def advanced_signal(df, mtf, crypto, futures):
 
 
     # --------------------------------------------------------
-    # EMA crossover
+    # EMA CROSSOVER
     # --------------------------------------------------------
 
     if (
-        prev.ema_fast <= prev.ema_slow
+        prev["ema_fast"]
+        <=
+        prev["ema_slow"]
         and
-        c.ema_fast > c.ema_slow
+        c["ema_fast"]
+        >
+        c["ema_slow"]
     ):
 
         long_score += 2
@@ -1080,9 +1232,13 @@ def advanced_signal(df, mtf, crypto, futures):
 
 
     if (
-        prev.ema_fast >= prev.ema_slow
+        prev["ema_fast"]
+        >=
+        prev["ema_slow"]
         and
-        c.ema_fast < c.ema_slow
+        c["ema_fast"]
+        <
+        c["ema_slow"]
     ):
 
         short_score += 2
@@ -1093,10 +1249,14 @@ def advanced_signal(df, mtf, crypto, futures):
 
 
     # --------------------------------------------------------
-    # EMA direction
+    # EMA DIRECTION
     # --------------------------------------------------------
 
-    if c.ema_fast > c.ema_slow:
+    if (
+        c["ema_fast"]
+        >
+        c["ema_slow"]
+    ):
 
         long_score += 1
 
@@ -1104,7 +1264,11 @@ def advanced_signal(df, mtf, crypto, futures):
             "EMA 9 above EMA 21"
         )
 
-    elif c.ema_fast < c.ema_slow:
+    elif (
+        c["ema_fast"]
+        <
+        c["ema_slow"]
+    ):
 
         short_score += 1
 
@@ -1117,7 +1281,11 @@ def advanced_signal(df, mtf, crypto, futures):
     # EMA 50
     # --------------------------------------------------------
 
-    if c.close > c.ema_trend:
+    if (
+        c["close"]
+        >
+        c["ema_trend"]
+    ):
 
         long_score += 1
 
@@ -1125,7 +1293,11 @@ def advanced_signal(df, mtf, crypto, futures):
             "Price above EMA 50"
         )
 
-    elif c.close < c.ema_trend:
+    elif (
+        c["close"]
+        <
+        c["ema_trend"]
+    ):
 
         short_score += 1
 
@@ -1138,7 +1310,11 @@ def advanced_signal(df, mtf, crypto, futures):
     # VWAP
     # --------------------------------------------------------
 
-    if c.close > c.vwap:
+    if (
+        c["close"]
+        >
+        c["vwap"]
+    ):
 
         long_score += 1
 
@@ -1146,7 +1322,11 @@ def advanced_signal(df, mtf, crypto, futures):
             "Price above VWAP"
         )
 
-    elif c.close < c.vwap:
+    elif (
+        c["close"]
+        <
+        c["vwap"]
+    ):
 
         short_score += 1
 
@@ -1159,43 +1339,55 @@ def advanced_signal(df, mtf, crypto, futures):
     # RSI
     # --------------------------------------------------------
 
-    if 50 < c.rsi < 70:
+    if 50 < c["rsi"] < 70:
 
         long_score += 1
 
         long_reasons.append(
-            f"RSI bullish zone ({c.rsi:.1f})"
+            f"RSI bullish zone ({c['rsi']:.1f})"
         )
 
-    elif 30 < c.rsi < 50:
+    elif 30 < c["rsi"] < 50:
 
         short_score += 1
 
         short_reasons.append(
-            f"RSI bearish zone ({c.rsi:.1f})"
+            f"RSI bearish zone ({c['rsi']:.1f})"
         )
 
 
     # --------------------------------------------------------
-    # Volume
+    # VOLUME
     # --------------------------------------------------------
 
-    if c.volume_ratio >= 1.2:
+    if (
+        c["volume_ratio"]
+        >=
+        MIN_VOLUME_RATIO
+    ):
 
-        if c.close > c.open:
+        if (
+            c["close"]
+            >
+            c["open"]
+        ):
 
             long_score += 1
 
             long_reasons.append(
-                f"High bullish volume ({c.volume_ratio:.2f}x)"
+                f"Bullish volume ({c['volume_ratio']:.2f}x)"
             )
 
-        elif c.close < c.open:
+        elif (
+            c["close"]
+            <
+            c["open"]
+        ):
 
             short_score += 1
 
             short_reasons.append(
-                f"High bearish volume ({c.volume_ratio:.2f}x)"
+                f"Bearish volume ({c['volume_ratio']:.2f}x)"
             )
 
 
@@ -1203,12 +1395,12 @@ def advanced_signal(df, mtf, crypto, futures):
     # ATR
     # --------------------------------------------------------
 
-    atr_pct = (
-        c.atr /
-        c.close
-    )
-
-    if atr_pct >= MIN_ATR_PCT:
+    if (
+        c["atr"] /
+        c["close"]
+        >=
+        MIN_ATR_PCT
+    ):
 
         long_score += 1
         short_score += 1
@@ -1237,11 +1429,9 @@ def advanced_signal(df, mtf, crypto, futures):
         )
 
         if "BULLISH" in status:
-
             bullish_count += 1
 
         if "BEARISH" in status:
-
             bearish_count += 1
 
 
@@ -1291,7 +1481,7 @@ def advanced_signal(df, mtf, crypto, futures):
 
 
     # --------------------------------------------------------
-    # SOL/BTC relative strength
+    # SOL VS BTC
     # --------------------------------------------------------
 
     sol_change = crypto.get(
@@ -1304,25 +1494,25 @@ def advanced_signal(df, mtf, crypto, futures):
         btc_change is not None
     ):
 
-        sol_btc_relative = (
+        relative_strength = (
             sol_change -
             btc_change
         )
 
-        if sol_btc_relative > 0.5:
+        if relative_strength > 0.5:
 
             long_score += 1
 
             long_reasons.append(
-                f"SOL outperforming BTC ({sol_btc_relative:+.2f}%)"
+                f"SOL outperforming BTC ({relative_strength:+.2f}%)"
             )
 
-        elif sol_btc_relative < -0.5:
+        elif relative_strength < -0.5:
 
             short_score += 1
 
             short_reasons.append(
-                f"SOL underperforming BTC ({sol_btc_relative:+.2f}%)"
+                f"SOL underperforming BTC ({relative_strength:+.2f}%)"
             )
 
 
@@ -1336,8 +1526,22 @@ def advanced_signal(df, mtf, crypto, futures):
 
     if oi_change is not None:
 
+        price_up = (
+            c["close"]
+            >
+            prev["close"]
+        )
+
+        price_down = (
+            c["close"]
+            <
+            prev["close"]
+        )
+
+
+        # Price up + OI up
         if (
-            c.close > prev.close
+            price_up
             and
             oi_change > 0
         ):
@@ -1349,8 +1553,9 @@ def advanced_signal(df, mtf, crypto, futures):
             )
 
 
+        # Price down + OI up
         elif (
-            c.close < prev.close
+            price_down
             and
             oi_change > 0
         ):
@@ -1363,15 +1568,17 @@ def advanced_signal(df, mtf, crypto, futures):
 
 
     # --------------------------------------------------------
-    # FINAL DECISION
+    # FINAL SIGNAL
     # --------------------------------------------------------
 
     side = None
 
+
     if (
         long_score >= MIN_LONG_SCORE
         and
-        long_score > short_score + 1
+        long_score >
+        short_score + 1
     ):
 
         side = "LONG"
@@ -1380,7 +1587,8 @@ def advanced_signal(df, mtf, crypto, futures):
     elif (
         short_score >= MIN_SHORT_SCORE
         and
-        short_score > long_score + 1
+        short_score >
+        long_score + 1
     ):
 
         side = "SHORT"
@@ -1396,7 +1604,7 @@ def advanced_signal(df, mtf, crypto, futures):
 
 
 # ============================================================
-# TRADE LEVELS
+# SL / TP
 # ============================================================
 
 def levels(
@@ -1407,36 +1615,36 @@ def levels(
 
     if side == "LONG":
 
-        sl = entry - (
-            SL_MULT *
-            atr
+        sl = (
+            entry -
+            SL_MULT * atr
         )
 
-        tp1 = entry + (
-            TP1_MULT *
-            atr
+        tp1 = (
+            entry +
+            TP1_MULT * atr
         )
 
-        tp2 = entry + (
-            TP2_MULT *
-            atr
+        tp2 = (
+            entry +
+            TP2_MULT * atr
         )
 
     else:
 
-        sl = entry + (
-            SL_MULT *
-            atr
+        sl = (
+            entry +
+            SL_MULT * atr
         )
 
-        tp1 = entry - (
-            TP1_MULT *
-            atr
+        tp1 = (
+            entry -
+            TP1_MULT * atr
         )
 
-        tp2 = entry - (
-            TP2_MULT *
-            atr
+        tp2 = (
+            entry -
+            TP2_MULT * atr
         )
 
     return sl, tp1, tp2
@@ -1448,57 +1656,64 @@ def levels(
 
 def get_market_condition(c):
 
-    price = c.close
+    price = c["close"]
 
+    ema9 = c["ema_fast"]
+    ema21 = c["ema_slow"]
+    ema50 = c["ema_trend"]
+    vwap = c["vwap"]
+    rsi = c["rsi"]
+
+
+    # Strong bullish
     if (
         price >
-        c.ema_fast >
-        c.ema_slow >
-        c.ema_trend
+        ema9 >
+        ema21 >
+        ema50
         and
-        price > c.vwap
+        price > vwap
         and
-        c.rsi >= 55
+        rsi >= 55
     ):
 
         return "🟢 STRONG BULLISH"
 
 
+    # Bullish
     if (
-        price > c.ema21
-        if False
-        else (
-            price > c.ema_slow
-            and
-            price > c.ema_trend
-            and
-            price > c.vwap
-        )
+        price > ema21
+        and
+        price > ema50
+        and
+        price > vwap
     ):
 
         return "🟢 BULLISH"
 
 
+    # Strong bearish
     if (
         price <
-        c.ema_fast <
-        c.ema_slow <
-        c.ema_trend
+        ema9 <
+        ema21 <
+        ema50
         and
-        price < c.vwap
+        price < vwap
         and
-        c.rsi <= 45
+        rsi <= 45
     ):
 
         return "🔴 STRONG BEARISH"
 
 
+    # Bearish
     if (
-        price < c.ema_slow
+        price < ema21
         and
-        price < c.ema_trend
+        price < ema50
         and
-        price < c.vwap
+        price < vwap
     ):
 
         return "🔴 BEARISH"
@@ -1524,28 +1739,28 @@ def get_warnings(
 
 
     # RSI
-    if c.rsi >= 70:
+    if c["rsi"] >= 70:
 
         warnings.append(
             "RSI is overbought"
         )
 
-    elif c.rsi <= 30:
+    elif c["rsi"] <= 30:
 
         warnings.append(
             "RSI is oversold"
         )
 
 
-    # Low volume
-    if c.volume_ratio < 0.8:
+    # Volume
+    if c["volume_ratio"] < 0.8:
 
         warnings.append(
             "Volume is below average"
         )
 
 
-    # High funding
+    # Funding
     funding = futures.get(
         "funding"
     )
@@ -1584,7 +1799,7 @@ def get_warnings(
     # Timeframe conflict
     statuses = []
 
-    for tf in [
+    for timeframe in [
         "5m",
         "15m",
         "1h",
@@ -1593,7 +1808,7 @@ def get_warnings(
 
         statuses.append(
             mtf.get(
-                tf,
+                timeframe,
                 {}
             ).get(
                 "status",
@@ -1617,7 +1832,304 @@ def get_warnings(
 
 
 # ============================================================
-# DETAILED REPORT
+# SIGNAL ALERT
+# ============================================================
+
+def send_signal_alert(
+    side,
+    df,
+    scoring,
+    crypto,
+    futures
+):
+
+    c = df.iloc[-2]
+
+    entry = c["close"]
+
+    sl, tp1, tp2 = levels(
+        side,
+        entry,
+        c["atr"]
+    )
+
+
+    emoji = (
+        "🟢"
+        if side == "LONG"
+        else
+        "🔴"
+    )
+
+
+    if side == "LONG":
+
+        reasons = scoring[
+            "long_reasons"
+        ]
+
+    else:
+
+        reasons = scoring[
+            "short_reasons"
+        ]
+
+
+    reason_text = ""
+
+    for reason in reasons[:7]:
+
+        reason_text += (
+            f"• {reason}\n"
+        )
+
+
+    btc_change = crypto.get(
+        "btc_change"
+    )
+
+    funding = futures.get(
+        "funding"
+    )
+
+
+    if funding is not None:
+
+        funding_text = (
+            f"{funding * 100:+.4f}%"
+        )
+
+    else:
+
+        funding_text = "N/A"
+
+
+    message = (
+
+        f"{emoji} {side} SIGNAL\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+
+        f"Pair: {SYMBOL}\n"
+        f"Timeframe: {TF}\n"
+        f"Time: {now_utc()}\n\n"
+
+        f"💰 Entry: {entry:.3f}\n"
+        f"🛑 Stop Loss: {sl:.3f}\n"
+        f"🎯 TP1: {tp1:.3f}\n"
+        f"🎯 TP2: {tp2:.3f}\n\n"
+
+        f"📊 SCORE\n"
+        f"LONG: {scoring['long_score']}\n"
+        f"SHORT: {scoring['short_score']}\n\n"
+
+        f"📈 TECHNICAL\n"
+        f"RSI: {c['rsi']:.1f}\n"
+        f"ATR: {c['atr']:.3f}\n"
+        f"VWAP: {c['vwap']:.3f}\n"
+        f"Volume: {c['volume_ratio']:.2f}x average\n\n"
+
+        f"₿ BTC 24h: {fmt(btc_change, 2)}%\n"
+        f"Funding: {funding_text}\n\n"
+
+        f"🧠 CONFIRMATION FACTORS\n"
+        f"{reason_text}\n"
+
+        f"⚠️ Rule-based market alert.\n"
+        f"No real order is placed."
+    )
+
+
+    send(message)
+
+
+# ============================================================
+# TRADE TRACKING
+# ============================================================
+
+def check_open_trades(
+    df,
+    open_trades,
+    processed_trade_candles
+):
+
+    wins = 0
+    losses = 0
+
+
+    for trade in open_trades[:]:
+
+        for j in range(
+            len(df) - 1
+        ):
+
+            candle = df.iloc[j]
+
+
+            # Only candles after entry
+            if (
+                candle["time"]
+                <=
+                trade["t"]
+            ):
+
+                continue
+
+
+            trade_key = (
+                trade["t"],
+                candle["time"]
+            )
+
+
+            if (
+                trade_key
+                in
+                processed_trade_candles
+            ):
+
+                continue
+
+
+            processed_trade_candles.add(
+                trade_key
+            )
+
+
+            # ------------------------------------------------
+            # LONG
+            # ------------------------------------------------
+
+            if trade["side"] == "LONG":
+
+                hit_sl = (
+                    candle["low"]
+                    <=
+                    trade["sl"]
+                )
+
+                hit_tp1 = (
+                    candle["high"]
+                    >=
+                    trade["tp1"]
+                )
+
+                hit_tp2 = (
+                    candle["high"]
+                    >=
+                    trade["tp2"]
+                )
+
+
+            # ------------------------------------------------
+            # SHORT
+            # ------------------------------------------------
+
+            else:
+
+                hit_sl = (
+                    candle["high"]
+                    >=
+                    trade["sl"]
+                )
+
+                hit_tp1 = (
+                    candle["low"]
+                    <=
+                    trade["tp1"]
+                )
+
+                hit_tp2 = (
+                    candle["low"]
+                    <=
+                    trade["tp2"]
+                )
+
+
+            # ------------------------------------------------
+            # SL FIRST
+            # ------------------------------------------------
+
+            if hit_sl:
+
+                losses += 1
+
+                send(
+                    f"❌ STOP LOSS HIT\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"Side: {trade['side']}\n"
+                    f"Pair: {SYMBOL}\n"
+                    f"Entry: {trade['entry']:.3f}\n"
+                    f"SL: {trade['sl']:.3f}\n"
+                    f"TP1: {trade['tp1']:.3f}\n"
+                    f"TP2: {trade['tp2']:.3f}\n\n"
+                    f"Result: LOSS\n"
+                    f"Simulated result only."
+                )
+
+                open_trades.remove(
+                    trade
+                )
+
+                break
+
+
+            # ------------------------------------------------
+            # TP2
+            # ------------------------------------------------
+
+            if hit_tp2:
+
+                wins += 1
+
+                send(
+                    f"✅ TP2 HIT\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"Side: {trade['side']}\n"
+                    f"Pair: {SYMBOL}\n"
+                    f"Entry: {trade['entry']:.3f}\n"
+                    f"TP1: {trade['tp1']:.3f}\n"
+                    f"TP2: {trade['tp2']:.3f}\n\n"
+                    f"Result: COMPLETE WIN\n"
+                    f"Simulated result only."
+                )
+
+                open_trades.remove(
+                    trade
+                )
+
+                break
+
+
+            # ------------------------------------------------
+            # TP1
+            # ------------------------------------------------
+
+            if (
+                hit_tp1
+                and
+                not trade["tp1_hit"]
+            ):
+
+                trade["tp1_hit"] = True
+
+                send(
+                    f"🎯 TP1 HIT\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"Side: {trade['side']}\n"
+                    f"Pair: {SYMBOL}\n"
+                    f"Entry: {trade['entry']:.3f}\n"
+                    f"TP1: {trade['tp1']:.3f}\n"
+                    f"TP2: {trade['tp2']:.3f}\n\n"
+                    f"Trade remains open for TP2.\n"
+                    f"Simulated result only."
+                )
+
+
+    return wins, losses
+
+
+# ============================================================
+# DETAILED MARKET REPORT
 # ============================================================
 
 def send_market_report(
@@ -1632,14 +2144,16 @@ def send_market_report(
 
     c = df.iloc[-2]
 
-    price = c.close
+    price = c["close"]
 
     condition = get_market_condition(
         c
     )
 
     support, resistance = (
-        get_support_resistance(df)
+        get_support_resistance(
+            df
+        )
     )
 
     structure = market_structure(
@@ -1651,7 +2165,9 @@ def send_market_report(
     # Volume
     # --------------------------------------------------------
 
-    volume_ratio = c.volume_ratio
+    volume_ratio = c[
+        "volume_ratio"
+    ]
 
     if volume_ratio >= 1.5:
 
@@ -1675,12 +2191,12 @@ def send_market_report(
     # --------------------------------------------------------
 
     atr_pct = (
-        c.atr /
+        c["atr"] /
         price
     ) * 100
 
 
-    if atr_pct >= 1:
+    if atr_pct >= 1.0:
 
         volatility = "🔥 High"
 
@@ -1697,19 +2213,19 @@ def send_market_report(
     # RSI
     # --------------------------------------------------------
 
-    if c.rsi >= 70:
+    if c["rsi"] >= 70:
 
         rsi_status = "⚠️ Overbought"
 
-    elif c.rsi >= 55:
+    elif c["rsi"] >= 55:
 
         rsi_status = "🟢 Bullish momentum"
 
-    elif c.rsi <= 30:
+    elif c["rsi"] <= 30:
 
         rsi_status = "⚠️ Oversold"
 
-    elif c.rsi <= 45:
+    elif c["rsi"] <= 45:
 
         rsi_status = "🔴 Bearish momentum"
 
@@ -1722,11 +2238,11 @@ def send_market_report(
     # Candle
     # --------------------------------------------------------
 
-    if c.close > c.open:
+    if c["close"] > c["open"]:
 
         candle = "🟢 Bullish"
 
-    elif c.close < c.open:
+    elif c["close"] < c["open"]:
 
         candle = "🔴 Bearish"
 
@@ -1745,10 +2261,8 @@ def send_market_report(
 
     if funding is not None:
 
-        funding_pct = funding * 100
-
         funding_text = (
-            f"{funding_pct:+.4f}%"
+            f"{funding * 100:+.4f}%"
         )
 
     else:
@@ -1789,7 +2303,7 @@ def send_market_report(
         "eth_change"
     )
 
-    btc_dom = crypto.get(
+    btc_dominance = crypto.get(
         "btc_dominance"
     )
 
@@ -1813,25 +2327,17 @@ def send_market_report(
     # Signal
     # --------------------------------------------------------
 
-    side = scoring["side"]
+    if scoring["side"] == "LONG":
 
-    if side == "LONG":
+        signal_text = "🟢 LONG"
 
-        signal_text = (
-            "🟢 LONG"
-        )
+    elif scoring["side"] == "SHORT":
 
-    elif side == "SHORT":
-
-        signal_text = (
-            "🔴 SHORT"
-        )
+        signal_text = "🔴 SHORT"
 
     else:
 
-        signal_text = (
-            "⚪ NO CONFIRMED SIGNAL"
-        )
+        signal_text = "⚪ NO CONFIRMED SIGNAL"
 
 
     # --------------------------------------------------------
@@ -1861,7 +2367,7 @@ def send_market_report(
 
 
     # --------------------------------------------------------
-    # News
+    # NEWS
     # --------------------------------------------------------
 
     news_text = ""
@@ -1876,11 +2382,13 @@ def send_market_report(
 
     else:
 
-        news_text = "No news available\n"
+        news_text = (
+            "No news available\n"
+        )
 
 
     # --------------------------------------------------------
-    # Warnings
+    # WARNINGS
     # --------------------------------------------------------
 
     warnings = get_warnings(
@@ -1912,7 +2420,9 @@ def send_market_report(
     # --------------------------------------------------------
 
     network_health = (
-        network.get("health")
+        network.get(
+            "health"
+        )
         or
         "N/A"
     )
@@ -1929,6 +2439,10 @@ def send_market_report(
         "tps"
     )
 
+
+    # --------------------------------------------------------
+    # BUILD MESSAGE
+    # --------------------------------------------------------
 
     message = (
 
@@ -1947,17 +2461,17 @@ def send_market_report(
 
 
         f"📈 TECHNICAL INDICATORS\n"
-        f"EMA 9: {c.ema_fast:.3f}\n"
-        f"EMA 21: {c.ema_slow:.3f}\n"
-        f"EMA 50: {c.ema_trend:.3f}\n"
-        f"VWAP: {c.vwap:.3f}\n"
-        f"RSI: {c.rsi:.1f} — {rsi_status}\n"
-        f"ATR: {c.atr:.3f}\n\n"
+        f"EMA 9: {c['ema_fast']:.3f}\n"
+        f"EMA 21: {c['ema_slow']:.3f}\n"
+        f"EMA 50: {c['ema_trend']:.3f}\n"
+        f"VWAP: {c['vwap']:.3f}\n"
+        f"RSI: {c['rsi']:.1f} — {rsi_status}\n"
+        f"ATR: {c['atr']:.3f}\n\n"
 
 
         f"📦 VOLUME\n"
-        f"Current: {c.volume:.2f}\n"
-        f"Average: {c.vol_avg:.2f}\n"
+        f"Current: {c['volume']:.2f}\n"
+        f"Average: {c['vol_avg']:.2f}\n"
         f"Ratio: {volume_ratio:.2f}x\n"
         f"Status: {volume_status}\n\n"
 
@@ -1968,8 +2482,8 @@ def send_market_report(
 
 
         f"📐 SUPPORT / RESISTANCE\n"
-        f"Support: {support:.3f}\n"
-        f"Resistance: {resistance:.3f}\n\n"
+        f"Support: {fmt(support)}\n"
+        f"Resistance: {fmt(resistance)}\n\n"
 
 
         f"🕐 MULTI-TIMEFRAME\n"
@@ -1978,14 +2492,11 @@ def send_market_report(
 
         f"₿ BTC / MARKET CONTEXT\n"
         f"BTC: ${fmt(btc_price, 2)}\n"
-        f"BTC 24h: "
-        f"{fmt(btc_change, 2)}%\n"
-        f"SOL 24h: "
-        f"{fmt(sol_change, 2)}%\n"
-        f"ETH 24h: "
-        f"{fmt(eth_change, 2)}%\n"
+        f"BTC 24h: {fmt(btc_change, 2)}%\n"
+        f"SOL 24h: {fmt(sol_change, 2)}%\n"
+        f"ETH 24h: {fmt(eth_change, 2)}%\n"
         f"BTC Dominance: "
-        f"{fmt(btc_dom, 2)}%\n\n"
+        f"{fmt(btc_dominance, 2)}%\n\n"
 
 
         f"📊 DERIVATIVES\n"
@@ -2019,6 +2530,7 @@ def send_market_report(
         f"🟢 LONG FACTORS\n"
     )
 
+
     for reason in scoring[
         "long_reasons"
     ][:8]:
@@ -2031,6 +2543,7 @@ def send_market_report(
     message += (
         "\n🔴 SHORT FACTORS\n"
     )
+
 
     for reason in scoring[
         "short_reasons"
@@ -2050,7 +2563,7 @@ def send_market_report(
 
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Next report: ~10 minutes\n"
-        f"Bot uses rule-based market data analysis.\n"
+        f"Rule-based market analysis.\n"
         f"No real orders are placed."
     )
 
@@ -2059,302 +2572,32 @@ def send_market_report(
 
 
 # ============================================================
-# SIGNAL ALERT
-# ============================================================
-
-def send_signal_alert(
-    side,
-    df,
-    scoring,
-    crypto,
-    futures
-):
-
-    c = df.iloc[-2]
-
-    entry = c.close
-
-    sl, tp1, tp2 = levels(
-        side,
-        entry,
-        c.atr
-    )
-
-    emoji = (
-        "🟢"
-        if side == "LONG"
-        else
-        "🔴"
-    )
-
-
-    if side == "LONG":
-
-        reasons = scoring[
-            "long_reasons"
-        ]
-
-    else:
-
-        reasons = scoring[
-            "short_reasons"
-        ]
-
-
-    reason_text = ""
-
-    for reason in reasons[:6]:
-
-        reason_text += (
-            f"• {reason}\n"
-        )
-
-
-    btc_change = crypto.get(
-        "btc_change"
-    )
-
-    funding = futures.get(
-        "funding"
-    )
-
-    if funding is not None:
-
-        funding_text = (
-            f"{funding * 100:+.4f}%"
-        )
-
-    else:
-
-        funding_text = "N/A"
-
-
-    message = (
-
-        f"{emoji} {side} SIGNAL\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-
-        f"Pair: {SYMBOL}\n"
-        f"Timeframe: {TF}\n"
-        f"Time: {now_utc()}\n\n"
-
-        f"💰 Entry: {entry:.3f}\n"
-        f"🛑 Stop Loss: {sl:.3f}\n"
-        f"🎯 TP1: {tp1:.3f}\n"
-        f"🎯 TP2: {tp2:.3f}\n\n"
-
-        f"📊 SCORE\n"
-        f"LONG: "
-        f"{scoring['long_score']}\n"
-        f"SHORT: "
-        f"{scoring['short_score']}\n\n"
-
-        f"📈 TECHNICAL\n"
-        f"RSI: {c.rsi:.1f}\n"
-        f"ATR: {c.atr:.3f}\n"
-        f"VWAP: {c.vwap:.3f}\n"
-        f"Volume: "
-        f"{c.volume_ratio:.2f}x average\n\n"
-
-        f"₿ BTC 24h: "
-        f"{fmt(btc_change, 2)}%\n"
-        f"Funding: "
-        f"{funding_text}\n\n"
-
-        f"🧠 CONFIRMATION FACTORS\n"
-        f"{reason_text}\n"
-
-        f"⚠️ This is a rule-based market alert, "
-        f"not a guaranteed prediction or trade order."
-    )
-
-
-    send(message)
-
-
-# ============================================================
-# TRADE MANAGEMENT
-# ============================================================
-
-def check_open_trades(
-    df,
-    open_trades,
-    processed_trade_candles
-):
-
-    wins = 0
-    losses = 0
-
-    for tr in open_trades[:]:
-
-        for j in range(
-            len(df) - 1
-        ):
-
-            k = df.iloc[j]
-
-            if k.time <= tr["t"]:
-                continue
-
-
-            trade_key = (
-                tr["t"],
-                k.time
-            )
-
-            if (
-                trade_key
-                in
-                processed_trade_candles
-            ):
-
-                continue
-
-
-            processed_trade_candles.add(
-                trade_key
-            )
-
-
-            # ------------------------------------------------
-            # LONG
-            # ------------------------------------------------
-
-            if tr["side"] == "LONG":
-
-                hit_sl = (
-                    k.low <= tr["sl"]
-                )
-
-                hit_tp1 = (
-                    k.high >= tr["tp1"]
-                )
-
-                hit_tp2 = (
-                    k.high >= tr["tp2"]
-                )
-
-
-            # ------------------------------------------------
-            # SHORT
-            # ------------------------------------------------
-
-            else:
-
-                hit_sl = (
-                    k.high >= tr["sl"]
-                )
-
-                hit_tp1 = (
-                    k.low <= tr["tp1"]
-                )
-
-                hit_tp2 = (
-                    k.low <= tr["tp2"]
-                )
-
-
-            # ------------------------------------------------
-            # SL HAS PRIORITY
-            # ------------------------------------------------
-
-            if hit_sl:
-
-                losses += 1
-
-                send(
-                    f"❌ STOP LOSS HIT\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"Side: {tr['side']}\n"
-                    f"Pair: {SYMBOL}\n"
-                    f"Entry: {tr['entry']:.3f}\n"
-                    f"SL: {tr['sl']:.3f}\n"
-                    f"TP1: {tr['tp1']:.3f}\n"
-                    f"TP2: {tr['tp2']:.3f}\n\n"
-                    f"Result: LOSS\n"
-                    f"⚠️ Same-candle SL/TP conflicts "
-                    f"are handled conservatively."
-                )
-
-                open_trades.remove(
-                    tr
-                )
-
-                break
-
-
-            # ------------------------------------------------
-            # TP2 = COMPLETE WIN
-            # ------------------------------------------------
-
-            if hit_tp2:
-
-                wins += 1
-
-                send(
-                    f"✅ TP2 HIT\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"Side: {tr['side']}\n"
-                    f"Pair: {SYMBOL}\n"
-                    f"Entry: {tr['entry']:.3f}\n"
-                    f"TP1: {tr['tp1']:.3f}\n"
-                    f"TP2: {tr['tp2']:.3f}\n\n"
-                    f"Result: COMPLETE WIN"
-                )
-
-                open_trades.remove(
-                    tr
-                )
-
-                break
-
-
-            # ------------------------------------------------
-            # TP1
-            # ------------------------------------------------
-
-            if (
-                hit_tp1
-                and
-                not tr["tp1_hit"]
-            ):
-
-                tr["tp1_hit"] = True
-
-                send(
-                    f"🎯 TP1 HIT\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"Side: {tr['side']}\n"
-                    f"Pair: {SYMBOL}\n"
-                    f"Entry: {tr['entry']:.3f}\n"
-                    f"TP1: {tr['tp1']:.3f}\n"
-                    f"TP2: {tr['tp2']:.3f}\n\n"
-                    f"Trade remains open for TP2."
-                )
-
-
-    return wins, losses
-
-
-# ============================================================
 # MAIN
 # ============================================================
 
 def main():
 
+    # --------------------------------------------------------
+    # TELEGRAM TEST
+    # --------------------------------------------------------
+
     send(
-        "🤖 SOL/USDT ADVANCED MARKET BOT STARTED\n"
+        "🤖 SOL/USDT ADVANCED BOT STARTED\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "✅ 5m signal monitoring\n"
-        "✅ Multi-timeframe analysis\n"
+        "✅ 15m / 1h / 4h analysis\n"
         "✅ BTC market context\n"
-        "✅ Funding + Open Interest\n"
-        "✅ Liquidation data\n"
+        "✅ SOL/BTC relative strength\n"
+        "✅ Funding rate\n"
+        "✅ Open Interest\n"
+        "✅ Liquidations\n"
         "✅ Solana network data\n"
         "✅ Crypto news\n"
-        "✅ 10-minute detailed reports\n"
+        "✅ Support/resistance\n"
+        "✅ Market structure\n"
+        "✅ 10-minute reports\n"
         "✅ Hypothetical SL/TP tracking\n"
-        "❌ No real trades are placed"
+        "❌ No real trades"
     )
 
 
@@ -2375,7 +2618,8 @@ def main():
     losses = 0
 
 
-    # Cached external data
+    # Cached external information
+
     crypto = {}
 
     futures = {}
@@ -2388,21 +2632,26 @@ def main():
 
 
     print(
-        "Advanced SOL bot started"
+        "Advanced SOL/USDT bot started."
     )
 
 
+    # ========================================================
+    # LOOP
+    # ========================================================
+
     while (
-        time.time() - start
+        time.time() -
+        start
         <
         RUN_SECONDS
     ):
 
         try:
 
-            # =================================================
-            # MAIN SOL DATA
-            # =================================================
+            # ------------------------------------------------
+            # MAIN 5M DATA
+            # ------------------------------------------------
 
             df = add_indicators(
                 get_df(
@@ -2413,17 +2662,31 @@ def main():
             )
 
 
+            if len(df) < 60:
+
+                print(
+                    "Not enough candles."
+                )
+
+                time.sleep(
+                    POLL
+                )
+
+                continue
+
+
             # Last CLOSED candle
+
             c = df.iloc[-2]
 
             candle_time = int(
-                c.time
+                c["time"]
             )
 
 
-            # =================================================
+            # ------------------------------------------------
             # EXTERNAL DATA
-            # =================================================
+            # ------------------------------------------------
 
             if (
                 time.time()
@@ -2434,7 +2697,7 @@ def main():
             ):
 
                 print(
-                    "Updating external market data..."
+                    "Updating external data..."
                 )
 
 
@@ -2463,16 +2726,16 @@ def main():
                 )
 
 
-            # =================================================
+            # ------------------------------------------------
             # NEWS
-            # =================================================
+            # ------------------------------------------------
 
             news = get_news()
 
 
-            # =================================================
-            # ADVANCED SIGNAL SCORE
-            # =================================================
+            # ------------------------------------------------
+            # ADVANCED SCORE
+            # ------------------------------------------------
 
             scoring = advanced_signal(
                 df,
@@ -2482,9 +2745,9 @@ def main():
             )
 
 
-            # =================================================
-            # CHECK OPEN TRADES
-            # =================================================
+            # ------------------------------------------------
+            # OPEN TRADE MANAGEMENT
+            # ------------------------------------------------
 
             w, l = check_open_trades(
                 df,
@@ -2497,9 +2760,9 @@ def main():
             losses += l
 
 
-            # =================================================
+            # ------------------------------------------------
             # NEW SIGNAL
-            # =================================================
+            # ------------------------------------------------
 
             fresh = (
                 time.time() * 1000
@@ -2525,11 +2788,12 @@ def main():
 
                 if side:
 
-                    # Avoid stacking many
-                    # identical-direction trades.
+                    # Don't open another
+                    # trade in same direction.
+
                     existing_side = any(
-                        tr["side"] == side
-                        for tr in open_trades
+                        trade["side"] == side
+                        for trade in open_trades
                     )
 
 
@@ -2544,13 +2808,13 @@ def main():
                         )
 
 
-                        entry = c.close
+                        entry = c["close"]
 
                         sl, tp1, tp2 = (
                             levels(
                                 side,
                                 entry,
-                                c.atr
+                                c["atr"]
                             )
                         )
 
@@ -2586,15 +2850,18 @@ def main():
                         )
 
 
-            # =================================================
+            # ------------------------------------------------
             # 10-MINUTE REPORT
-            # =================================================
+            # ------------------------------------------------
 
-            now = time.time()
+            current_time = (
+                time.time()
+            )
 
 
             if (
-                now - last_report
+                current_time -
+                last_report
                 >=
                 REPORT_INTERVAL
             ):
@@ -2610,25 +2877,38 @@ def main():
                 )
 
 
-                last_report = now
+                last_report = (
+                    current_time
+                )
 
 
-            # =================================================
-            # CONSOLE
-            # =================================================
+            # ------------------------------------------------
+            # CONSOLE STATUS
+            # ------------------------------------------------
 
             print(
                 datetime.now().strftime(
                     "%H:%M:%S"
                 ),
                 "| Price:",
-                round(c.close, 3),
+                round(
+                    c["close"],
+                    3
+                ),
                 "| LONG:",
-                scoring["long_score"],
+                scoring[
+                    "long_score"
+                ],
                 "| SHORT:",
-                scoring["short_score"],
+                scoring[
+                    "short_score"
+                ],
                 "| Signal:",
-                scoring["side"]
+                scoring[
+                    "side"
+                ],
+                "| Trades:",
+                len(open_trades)
             )
 
 
@@ -2642,20 +2922,21 @@ def main():
         )
 
 
-    # =========================================================
-    # FINAL
-    # =========================================================
+    # ========================================================
+    # SESSION END
+    # ========================================================
 
     send(
         "🛑 BOT SESSION FINISHED\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"Session: ~{RUN_SECONDS // 60} minutes\n"
-        f"Completed hypothetical wins: {wins}\n"
-        f"Completed hypothetical losses: {losses}\n"
-        f"Open hypothetical trades: "
+        f"Runtime: "
+        f"{RUN_SECONDS // 60} minutes\n"
+        f"Hypothetical Wins: {wins}\n"
+        f"Hypothetical Losses: {losses}\n"
+        f"Open Trades: "
         f"{len(open_trades)}\n\n"
-        f"⚠️ These are simulated signal outcomes "
-        f"based on candle data. No real orders were placed."
+        f"⚠️ Results are simulated from candle data.\n"
+        f"No real orders were placed."
     )
 
 
@@ -2664,6 +2945,4 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
-
     main()
-```
