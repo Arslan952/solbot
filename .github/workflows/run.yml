@@ -49,7 +49,7 @@ jobs:
           CHART_WITH_REPORT: "0"
           LIQ_WS: "1"
         run: |
-          python btc_market_bot.py
+          python bot.py
 
       - name: Save bot state
         if: always()
