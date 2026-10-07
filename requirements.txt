@@ -1,4 +1,5 @@
-ccxt
-pandas
-numpy
-requests
+requests>=2.31
+pandas>=2.0
+numpy>=1.26
+websocket-client>=1.7   # optional: live liquidation feed
+matplotlib>=3.8         # optional: charts
