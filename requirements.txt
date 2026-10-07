@@ -1,5 +1,5 @@
-requests>=2.31
-pandas>=2.0
-numpy>=1.26
-websocket-client>=1.7   # optional: live liquidation feed
-matplotlib>=3.8         # optional: charts
+requests>=2.31,<3
+pandas>=2.0,<3
+numpy>=1.26,<3
+websocket-client>=1.7,<2
+matplotlib>=3.8,<4
