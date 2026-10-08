@@ -2,8 +2,13 @@ name: BTC Market Bot
 
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    # Hourly trigger + concurrency queue = the next session starts right after the
+    # previous one ends (no 15+ minute gaps with unmanaged trades / unanswered commands).
+    - cron: "0 * * * *"
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: btc-market-bot
@@ -35,6 +40,7 @@ jobs:
           path: |
             btc_market_state.json
             btc_trade_log.csv
+            btc_signal_log.jsonl
           key: btc-state-${{ github.run_id }}
           restore-keys: |
             btc-state-
@@ -48,6 +54,8 @@ jobs:
           REPORT_MODE: "short"
           CHART_WITH_REPORT: "0"
           LIQ_WS: "1"
+          MAX_LEVERAGE: "3"
+          SIGNAL_CONFIRM: "3"
         run: |
           python bot.py
 
@@ -58,4 +66,5 @@ jobs:
           path: |
             btc_market_state.json
             btc_trade_log.csv
+            btc_signal_log.jsonl
           key: btc-state-${{ github.run_id }}
