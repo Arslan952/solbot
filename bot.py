@@ -12,6 +12,7 @@ import signal
 import threading
 import traceback
 import xml.etree.ElementTree as ET
+from urllib.parse import urlparse
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -22,7 +23,7 @@ import requests
 
 
 # ============================================================
-# BTC MARKET INTELLIGENCE TELEGRAM BOT  (v3.1)
+# BTC MARKET INTELLIGENCE TELEGRAM BOT  (v3.2)
 # ------------------------------------------------------------
 #  1. Signal tracking: every LONG/SHORT is logged and followed
 #     until it hits stop / TP1 / TP2; win-rate + R stats
@@ -87,6 +88,13 @@ REENTRY_MIN = 30               # minimum gap after ANY trade closes/expires
 FEE_RATE = 0.0004              # 0.04% per side (taker) used in R results
 ADX_MIN = 18.0                 # below this the market is "ranging"
 VOLUME_MIN_RATIO = 0.9         # need at least ~average volume
+MAKER_FEE = 0.0002             # limit orders (entry, take-profit)
+TAKER_FEE = 0.0004             # market/stop orders
+SLIPPAGE = 0.0002              # 0.02% extra cost on stop-type exits
+MAX_LEVERAGE = float(os.environ.get("MAX_LEVERAGE", "3"))   # position size cap vs account
+SIGNAL_CONFIRM = int(os.environ.get("SIGNAL_CONFIRM", "3"))  # consecutive checks before alert
+STALE_MIN = 15                 # fallback cache max age (minutes)
+FEATURE_LOG = os.environ.get("FEATURE_LOG", "btc_signal_log.jsonl")
 
 # ---- data sources ------------------------------------------------
 BINANCE_SPOT_HOSTS = [
@@ -97,6 +105,8 @@ BINANCE_SPOT_HOSTS = [
 BINANCE_FUTURES = "https://fapi.binance.com"
 OKX = "https://www.okx.com"
 BYBIT = "https://api.bybit.com"
+DERIBIT = "https://www.deribit.com"
+COINGECKO = "https://api.coingecko.com"
 
 FF_CALENDAR_URLS = [
     "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
@@ -133,7 +143,7 @@ BEAR_TRENDS = ("BEARISH", "WEAK BEARISH")
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "BTC-Market-Intelligence-Bot/3.1",
+    "User-Agent": "BTC-Market-Intelligence-Bot/3.2",
     "Accept": "*/*",
 })
 
@@ -145,6 +155,12 @@ CTX = {}                           # latest everything (for commands/buttons)
 HEALTH = {"price": time.time()}    # last time price data was OK
 NEWS_AI_CACHE = {"sig": None, "text": None}
 FNG_CACHE = {"ts": 0, "data": None}
+GLOBAL_CACHE = {"ts": 0, "data": None}
+OPT_CACHE = {"ts": 0, "data": None}
+FF_CACHE = {"ts": 0, "events": None}
+TF_TS = {}                         # last fetch time of slow timeframes (1d, 1w)
+SOURCE_HEALTH = {}                 # per-host request success/failure counters
+LANG_CACHE = {}
 
 LIQ_EVENTS = deque(maxlen=5000)
 LIQ_LOCK = threading.Lock()
@@ -227,22 +243,27 @@ def clean_text(text):
 
 
 def http_json(url, params=None, headers=None, timeout=12, retries=1):
-    """GET json with one retry. Geo-blocks / auth errors are not retried."""
+    """GET json with one retry. Geo-blocks / auth errors are not retried.
+    Success/failure per host is tracked for the /health command."""
     for attempt in range(retries + 1):
         try:
             r = session.get(url, params=params or {}, headers=headers, timeout=timeout)
             if r.status_code in (400, 401, 403, 404, 451):
                 print("HTTP", r.status_code, url[:90])
+                _track(url, False)
                 return None
             if r.status_code == 429:
                 time.sleep(min(float(r.headers.get("Retry-After", 2)), 5))
                 continue
             r.raise_for_status()
-            return r.json()
+            data = r.json()
+            _track(url, True)
+            return data
         except Exception as e:
             print("HTTP error:", url[:90], str(e)[:100])
             if attempt < retries:
                 time.sleep(0.8 * (attempt + 1))
+    _track(url, False)
     return None
 
 
@@ -352,6 +373,10 @@ def default_state():
         "health_alert": False,
         "started_at": time.time(),
         "last_card": None,
+        "price_hist": [],
+        "event_reactions": {},
+        "sig_streak": {"action": None, "count": 0},
+        "lang": "en",
     }
 
 
@@ -375,6 +400,8 @@ def save_state(state):
         state["breaking_times"] = [t for t in state["breaking_times"] if time.time() - t < 3600]
         state["oi_history"] = state["oi_history"][-400:]
         state["trades"] = state["trades"][-500:]
+        state["price_hist"] = [p for p in state.get("price_hist", [])
+                               if time.time() - p[0] < 3 * 3600][-400:]
         for k in ("event_alerts", "market_open_alerts", "last_actual_events"):
             if len(state[k]) > 500:
                 state[k] = dict(list(state[k].items())[-300:])
@@ -391,7 +418,7 @@ def save_state(state):
 # PRICE DATA  (Binance -> OKX -> Coinbase)
 # ============================================================
 
-OKX_BAR = {"5m": "5m", "15m": "15m", "1h": "1H", "4h": "4H"}
+OKX_BAR = {"5m": "5m", "15m": "15m", "1h": "1H", "4h": "4H", "1d": "1Dutc", "1w": "1Wutc"}
 KLINE_COLS = ["time", "open", "high", "low", "close", "volume"]
 
 
@@ -541,9 +568,16 @@ def snapshot(row):
 
 def build_technical_context():
     result = {}
-    for tf, limit in [("5m", 300), ("15m", 300), ("1h", 300), ("4h", 250)]:
+    for tf, limit in [("5m", 300), ("15m", 300), ("1h", 300), ("4h", 250),
+                      ("1d", 300), ("1w", 250)]:
+        ttl = SLOW_TFS.get(tf)
+        if ttl and TECH_CACHE.get(tf) and time.time() - TF_TS.get(tf, 0) < ttl:
+            result[tf] = TECH_CACHE[tf]
+            continue
+        if ttl:
+            TF_TS[tf] = time.time()
         df = add_indicators(get_klines(tf, limit))
-        if len(df) < 80:
+        if len(df) < (60 if ttl else 80):
             result[tf] = TECH_CACHE.get(tf, {})
             continue
         CANDLES[tf] = df
@@ -679,7 +713,8 @@ def _okx_liquidations():
 
 def get_futures_context(state):
     res = {"funding": None, "open_interest": None, "oi_change_pct": None,
-           "long_liquidation": None, "short_liquidation": None}
+           "long_liquidation": None, "short_liquidation": None, "stale": []}
+    oi_src = None
 
     p = http_json(BINANCE_FUTURES + "/fapi/v1/premiumIndex", {"symbol": BTC_SYMBOL})
     if isinstance(p, dict):
@@ -687,6 +722,8 @@ def get_futures_context(state):
     o = http_json(BINANCE_FUTURES + "/fapi/v1/openInterest", {"symbol": BTC_SYMBOL})
     if isinstance(o, dict):
         res["open_interest"] = safe_float(o.get("openInterest"))
+        if res["open_interest"] is not None:
+            oi_src = "binance"
 
     if res["funding"] is None or res["open_interest"] is None:
         b = http_json(BYBIT + "/v5/market/tickers", {"category": "linear", "symbol": BTC_SYMBOL})
@@ -696,6 +733,8 @@ def get_futures_context(state):
                 res["funding"] = safe_float(item.get("fundingRate"))
             if res["open_interest"] is None:
                 res["open_interest"] = safe_float(item.get("openInterest"))
+                if res["open_interest"] is not None:
+                    oi_src = "bybit"
         except Exception:
             pass
 
@@ -710,30 +749,36 @@ def get_futures_context(state):
                        {"instType": "SWAP", "instId": "BTC-USDT-SWAP"})
         try:
             res["open_interest"] = safe_float(oi["data"][0].get("oiCcy"))
+            if res["open_interest"] is not None:
+                oi_src = "okx"
         except Exception:
             pass
 
     now = time.time()
-    if res["open_interest"] is not None:
+    if res["open_interest"] is not None and oi_src:
         hist = state.setdefault("oi_history", [])
-        hist.append([now, res["open_interest"]])
+        hist.append([now, res["open_interest"], oi_src])
         state["oi_history"] = hist = [h for h in hist if now - h[0] < 3 * 3600]
-        older = [h for h in hist if h[0] <= now - 5 * 60]
+        # Only compare readings from the SAME exchange (units/definitions differ).
+        older = [h for h in hist if len(h) > 2 and h[2] == oi_src and h[0] <= now - 5 * 60]
         if older:
             ref = min(older, key=lambda h: abs(h[0] - (now - 30 * 60)))
             res["oi_change_pct"] = pct_change(res["open_interest"], ref[1])
             res["oi_window_min"] = int((now - ref[0]) / 60)
+        res["oi_source"] = oi_src
 
     lng, sht = liq_from_ws()
     if lng is None:
         lng, sht = _okx_liquidations()
     res["long_liquidation"], res["short_liquidation"] = lng, sht
 
-    for k, v in res.items():
-        if v is None and k in FUT_CACHE and k not in ("long_liquidation", "short_liquidation"):
-            res[k] = FUT_CACHE[k]
-        elif v is not None:
-            FUT_CACHE[k] = v
+    # Short-lived fallback cache: reuse a value only if it is < STALE_MIN old, and say so.
+    for k in ("funding", "open_interest"):
+        if res[k] is not None:
+            FUT_CACHE[k] = (res[k], now)
+        elif k in FUT_CACHE and now - FUT_CACHE[k][1] < STALE_MIN * 60:
+            res[k] = FUT_CACHE[k][0]
+            res["stale"].append(k)
     return res
 
 
@@ -799,10 +844,15 @@ def get_cross_market():
     for name, symbol in YAHOO_SYMBOLS.items():
         q = yahoo_quote(symbol)
         if q.get("price") is not None:
+            q["ts"] = time.time()
             CROSS_CACHE[name] = q
             result[name] = q
         else:
-            result[name] = CROSS_CACHE.get(name, {})
+            old = CROSS_CACHE.get(name)
+            if old and time.time() - old.get("ts", 0) < 30 * 60:
+                result[name] = dict(old, stale=True)
+            else:
+                result[name] = {}
         time.sleep(0.3)
     return result
 
@@ -842,31 +892,10 @@ def news_key(item):
 
 
 def news_impact(item):
-    text = f"{item.get('title', '')} {item.get('description', '')}".lower()
-
-    high_words = [
-        "fed", "federal reserve", "fomc", "rate hike", "rate cut",
-        "interest rate", "cpi", "pce", "ppi", "nonfarm", "payroll",
-        "unemployment", "jobs report", "treasury", "yield",
-        "etf", "sec", "regulation", "ban", "approval", "hack",
-        "liquidation", "war", "sanction", "tariff", "china",
-        "bitcoin reserve", "sovereign", "default", "recession",
-    ]
-    bullish_words = [
-        "etf inflow", "inflows", "approval", "approved", "adoption",
-        "reserve", "rate cut", "cuts rates", "dovish", "easing",
-        "liquidity", "stimulus", "buying", "accumulation",
-        "bullish", "breakout", "surge", "rally", "record inflow",
-    ]
-    bearish_words = [
-        "etf outflow", "outflows", "rejected", "ban", "hack",
-        "rate hike", "hikes rates", "hawkish", "tightening",
-        "liquidation", "selling", "sell-off", "bearish", "crash",
-        "sanction", "tariff", "inflation", "yields rise",
-    ]
-    hs = sum(1 for x in high_words if x in text)
-    bs = sum(1 for x in bullish_words if x in text)
-    rs = sum(1 for x in bearish_words if x in text)
+    text = f"{item.get('title', '')} {item.get('description', '')}"
+    hs = sum(1 for rx in _HIGH_RX if rx.search(text))
+    bs = sum(1 for rx in _BULL_RX if rx.search(text))
+    rs = sum(1 for rx in _BEAR_RX if rx.search(text))
 
     direction = "BULLISH" if bs > rs else "BEARISH" if rs > bs else "MIXED"
     impact = "HIGH" if hs >= 2 else "MEDIUM" if hs == 1 else "LOW"
@@ -988,7 +1017,9 @@ def check_breaking_news(state, news):
 # ECONOMIC CALENDAR
 # ============================================================
 
-CALENDAR_CURRENCIES = ("USD", "US", "GLOBAL", "EUR", "EU", "JPY", "CNY", "CN", "GBP", "ALL", "")
+CAL_ALL_CCY = os.environ.get("CAL_ALL_CCY", "0") == "1"   # 1 = also EUR/JPY/GBP/CNY events
+CALENDAR_CURRENCIES = (("USD", "US", "GLOBAL", "ALL", "") if not CAL_ALL_CCY else
+                       ("USD", "US", "GLOBAL", "EUR", "EU", "JPY", "CNY", "CN", "GBP", "ALL", ""))
 
 
 def _none_if_empty(v):
@@ -999,6 +1030,8 @@ def _none_if_empty(v):
 
 
 def fetch_calendar_ff():
+    if FF_CACHE["events"] is not None and time.time() - FF_CACHE["ts"] < _ff_ttl():
+        return FF_CACHE["events"]
     events, got_any = [], False
     for url in FF_CALENDAR_URLS:
         data = http_json(url, timeout=15)
@@ -1022,7 +1055,10 @@ def fetch_calendar_ff():
                 "url": "https://www.forexfactory.com/calendar",
             })
         time.sleep(1)
-    return events if got_any else None
+    if not got_any:
+        return FF_CACHE["events"]   # keep serving the last good copy (or None -> fallback source)
+    FF_CACHE.update(ts=time.time(), events=events)
+    return events
 
 
 def fetch_calendar_fc():
@@ -1218,9 +1254,10 @@ def oi_words(futures):
     oi, ch = futures.get("open_interest"), futures.get("oi_change_pct")
     if oi is None:
         return "Open interest: could not be fetched from any exchange this cycle"
-    base = f"Open interest: {oi:,.0f} BTC"
+    stale = " (stale)" if "open_interest" in (futures.get("stale") or []) else ""
+    base = f"Open interest: {oi:,.0f} BTC{stale}"
     if ch is None:
-        return base + " (change shows after ~5 min of history)"
+        return base + " (change shows after ~5 min of history from the same exchange)"
     meaning = ("lots of NEW money entering -> bigger move likely" if ch > 2 else
                "traders closing positions -> move may be fading" if ch < -2 else
                "no big change")
@@ -1267,10 +1304,11 @@ def fng_words(fng):
 def cross_line(name, a, good_if_up, label):
     if not a or a.get("price") is None:
         return f"{label}: temporarily unavailable"
+    stale = " (stale)" if a.get("stale") else ""
     ch = a.get("change")
     price_txt = f"{a['price']:,.2f}"
     if ch is None:
-        return f"{label}: {price_txt}"
+        return f"{label}: {price_txt}{stale}"
     if good_if_up is None:
         meaning = ("safe-haven demand rising" if ch > 0.4 else
                    "safe-haven demand falling" if ch < -0.4 else "flat")
@@ -1281,7 +1319,7 @@ def cross_line(name, a, good_if_up, label):
         else:
             helps = (ch > 0) == bool(good_if_up)
             meaning = "good for BTC ✅" if helps else "bad for BTC ❌"
-    return f"{label}: {price_txt} ({ch:+.2f}%) -> {meaning}"
+    return f"{label}: {price_txt} ({ch:+.2f}%) -> {meaning}{stale}"
 
 
 # ============================================================
@@ -1508,6 +1546,11 @@ def build_trade_plan(bias, tech, levels, events, account=ACCOUNT_DEFAULT,
         used_pct = risk_pct * mult
         risk_usd = account * used_pct / 100
         size_btc = risk_usd / risk if risk > 0 else 0
+        max_size = account * MAX_LEVERAGE / entry if entry > 0 else size_btc
+        capped = size_btc > max_size
+        if capped:
+            size_btc = max_size
+            risk_usd = size_btc * risk      # real risk after the cap
 
         plan.update({
             "entry": entry, "stop": stop, "tp1": tp1, "tp2": tp2,
@@ -1517,6 +1560,7 @@ def build_trade_plan(bias, tech, levels, events, account=ACCOUNT_DEFAULT,
             "vol_note": ("high volatility -> position size reduced" if mult < 1 else ""),
             "account": account, "risk_usd": risk_usd,
             "size_btc": size_btc, "notional": size_btc * entry,
+            "leverage": (size_btc * entry / account) if account else 0, "capped": capped,
         })
     else:
         plan["trigger_long"] = (resistance if resistance and price < resistance <= price + 3 * atr
@@ -1536,7 +1580,7 @@ def plan_text_lines(plan, bias):
         sgn2 = "-" if long else "+"
         lines += [
             f"✅ {plan['action']} ({'BUY' if long else 'SELL'}) setup - {plan['strength']} "
-            f"- confidence {bias['confidence']}%",
+            f"- setup strength {strength_stars(bias['score'])}",
             f"Order:         {'BUY' if long else 'SELL'} LIMIT at {fmt_price(plan['entry'])} "
             f"(waits for a small pullback; auto-cancels if not filled in {EXPIRE_MIN // 60}h)",
             f"Stop-loss:     {fmt_price(plan['stop'])}  ({sgn2}{plan['risk_pct']:.2f}%)  <- exit here if wrong",
@@ -1553,14 +1597,20 @@ def plan_text_lines(plan, bias):
         lines.append(f"Why: {w}")
 
     if plan["action"] in ("LONG", "SHORT"):
+        lev = plan.get("leverage") or 0
         lines += [
             "",
-            f"💰 Position size: risk {plan['risk_used_pct']:.2f}% of ${plan['account']:,.0f} "
-            f"= ${plan['risk_usd']:,.2f}"
+            f"💰 Position size: risk ${plan['risk_usd']:,.2f} "
+            f"({plan['risk_usd'] / plan['account'] * 100:.2f}% of ${plan['account']:,.0f})"
             + (f"  ({plan['vol_note']})" if plan.get("vol_note") else ""),
-            f"-> size ~{plan['size_btc']:.4f} BTC (~${plan['notional']:,.0f} position)",
-            "Change account size with /account 500, risk with /risk 0.5",
+            f"-> size ~{plan['size_btc']:.4f} BTC (~${plan['notional']:,.0f} position, ≈{lev:.1f}x leverage)",
         ]
+        if plan.get("capped"):
+            lines.append(f"⚠️ Size was capped at {MAX_LEVERAGE:.0f}x leverage, so your real risk is "
+                         "smaller than planned. The stop is wide for this account size.")
+        elif lev > 1:
+            lines.append(f"Needs ≈{lev:.1f}x leverage / margin - set this on your exchange first.")
+        lines.append("Change account size with /account 500, risk with /risk 0.5")
     else:
         lines += [
             "",
@@ -1591,18 +1641,26 @@ def new_trade(plan, ts):
 
 
 def close_trade(t, exit_price, ts, outcome):
+    """Result in R after realistic costs: maker fee on entry/TP exits,
+    taker fee + slippage on stop-type exits."""
     is_long = t["action"] == "LONG"
     risk, entry = t["risk"], t["entry"]
+    taker_exit = outcome in ("STOP", "BREAKEVEN", "TRAIL")
+    px = exit_price
+    if taker_exit:
+        px = exit_price * (1 - SLIPPAGE) if is_long else exit_price * (1 + SLIPPAGE)
 
-    def r_of(px):
-        return ((px - entry) if is_long else (entry - px)) / risk
+    def r_of(p):
+        return ((p - entry) if is_long else (entry - p)) / risk
 
     if t["tp1_hit"]:
-        r = TP1_FRACTION * t["rr1"] + (1 - TP1_FRACTION) * r_of(exit_price)
+        r = TP1_FRACTION * t["rr1"] + (1 - TP1_FRACTION) * r_of(px)
+        exit_fee = TP1_FRACTION * MAKER_FEE + (1 - TP1_FRACTION) * (TAKER_FEE if taker_exit else MAKER_FEE)
     else:
-        r = r_of(exit_price)
+        r = r_of(px)
+        exit_fee = TAKER_FEE if taker_exit else MAKER_FEE
 
-    fee_r = 2 * FEE_RATE * entry / risk
+    fee_r = (MAKER_FEE + exit_fee) * entry / risk
     t.update(status="CLOSED", closed_at=ts, exit_price=exit_price,
              outcome=outcome, result_r=round(r - fee_r, 3))
 
@@ -1789,6 +1847,8 @@ def stats_lines(trades, title="Track record", account=None):
     if account:
         lines.append(f"(1R = {RISK_PCT_DEFAULT:.0f}% of account -> total ~ "
                      f"{s['total_r'] * RISK_PCT_DEFAULT:+.1f}% on ${account:,.0f})")
+    if s["n"] < 100:
+        lines.append(f"⚠️ Only {s['n']} closed trades - too few to trust the win rate (aim for 100+).")
     return lines
 
 
@@ -1800,6 +1860,7 @@ def finish_trade(state, t):
         log_trade_csv(t)
         if t["outcome"] == "STOP":
             state["cooldown_until"] = time.time() + COOLDOWN_MIN * 60
+    log_trade_features(t)
     state["trades"].append(t)
     state["active_trade"] = None
 
@@ -1845,6 +1906,14 @@ def process_signal(state, plan, bias, live_price):
     t = state.get("active_trade")
     now = time.time()
 
+    # Signal persistence: the same LONG/SHORT must hold for SIGNAL_CONFIRM checks in a row.
+    sig = plan["action"] if plan["action"] in ("LONG", "SHORT") else None
+    streak = state.setdefault("sig_streak", {"action": None, "count": 0})
+    if sig and streak.get("action") == sig:
+        streak["count"] = streak.get("count", 0) + 1
+    else:
+        streak["action"], streak["count"] = sig, (1 if sig else 0)
+
     if t:
         direction = 1 if t["action"] == "LONG" else -1
         if t["status"] == "PENDING":
@@ -1873,9 +1942,11 @@ def process_signal(state, plan, bias, live_price):
     if now - state.get("last_close_ts", 0) < REENTRY_MIN * 60:
         return  # short breather after any trade ends
 
-    if plan["action"] in ("LONG", "SHORT"):
+    if sig and streak["count"] >= SIGNAL_CONFIRM:
         t = new_trade(plan, now)
+        t["features"] = signal_features(bias, plan)
         state["active_trade"] = t
+        streak["count"] = 0
         lines = ["🚨 TRADE ALERT", "━━━━━━━━━━━━━━━━━━━━"]
         lines += plan_text_lines(plan, bias)
         lines += ["", "You will get follow-up messages for fill, TP1, trailing stop and exit.",
@@ -1964,8 +2035,11 @@ def event_alert_message(event, minutes_to_event):
     for label, key in (("Expected", "forecast"), ("Previous", "previous"), ("Actual", "actual")):
         if event.get(key) is not None:
             lines.append(f"{label}: {event[key]}")
-    lines += ["", f"BTC reading: {direction}", explanation, "", todo,
-              "⚠️ The first reaction can reverse quickly."]
+    lines += ["", f"BTC reading: {direction}", explanation]
+    rt = reaction_text(CTX.get("state") or {}, event["name"])
+    if rt:
+        lines.append(rt)
+    lines += ["", todo, "⚠️ The first reaction can reverse quickly."]
     return "\n".join(lines)
 
 
@@ -2027,6 +2101,10 @@ def check_daily_summary(state):
         lines = ["🗓 DAILY SUMMARY", "━━━━━━━━━━━━━━━━━━━━"]
         lines += stats_lines(day, "Last 24 hours")
         lines += [""] + stats_lines(state["trades"], "All time", state.get("account"))
+        bad = [h for h, v in SOURCE_HEALTH.items()
+               if v["ok"] + v["fail"] >= 5 and v["fail"] / (v["ok"] + v["fail"]) > 0.5]
+        if bad:
+            lines += ["", "⚠️ Data sources failing often: " + ", ".join(bad) + "  (see /health)"]
         send("\n".join(lines))
         state["last_daily"] = today
 
@@ -2120,7 +2198,7 @@ def build_report(state):
 
     summary = list(head) + [
         "",
-        f"Mood: {bias['bias']} ({bias['confidence']}%) | 1h: {trend_words(h1.get('trend'))} "
+        f"Mood: {bias['bias']} (strength {strength_stars(bias['score'])}) | 1h: {trend_words(h1.get('trend'))} "
         f"| 4h: {trend_words(h4.get('trend'))}",
     ]
     nxt = upcoming_high_event(events, 7 * 24 * 60)
@@ -2201,7 +2279,7 @@ def send_market_report(state):
 
 
 # ============================================================
-# REPORT UI  (headline card + tabs that edit one message)
+# REPORT UI, EXTRA DATA, HELPERS
 # ============================================================
 
 def esc(x):
@@ -2232,16 +2310,20 @@ def _age(ts):
 
 
 def _dist(level, price):
-    """'$68,100 (+1.0%)' - distance from current price."""
+    """'$68,100.00 (+1.0%)' - distance from current price."""
     if level is None or not price:
         return "n/a"
     return f"{fmt_price(level)} ({(level - price) / price * 100:+.1f}%)"
 
 
+def _plain(html_text):
+    return _html.unescape(re.sub(r"<[^>]+>", "", html_text))
+
+
 def tg_send_html(text, reply_markup=None):
     """Send HTML; if Telegram rejects the markup, fall back to plain text."""
     if not TOKEN or not CHAT_ID:
-        print("[Telegram not configured] ->\n" + _html.unescape(re.sub(r"<[^>]+>", "", text)) + "\n")
+        print("[Telegram not configured] ->\n" + _plain(text) + "\n")
         return None
     data = {"chat_id": CHAT_ID, "text": text[:4000], "parse_mode": "HTML",
             "disable_web_page_preview": "true"}
@@ -2249,14 +2331,9 @@ def tg_send_html(text, reply_markup=None):
         data["reply_markup"] = json.dumps(reply_markup)
     res = tg_post("sendMessage", data)
     if not res or not res.get("ok"):
-        plain = _html.unescape(re.sub(r"<[^>]+>", "", text))
-        send(plain, reply_markup)
+        send(_plain(text), reply_markup)
     return res
 
-
-# ------------------------------------------------------------
-# tabs / buttons
-# ------------------------------------------------------------
 
 TAB_LABELS = {
     "summary": "🏠 Summary", "trend": "📈 Trend", "futures": "🎲 Futures",
@@ -2272,10 +2349,6 @@ def tab_keyboard(active="summary"):
     rows.append([{"text": "🖼 Chart", "callback_data": "chart"}])
     return {"inline_keyboard": rows}
 
-
-# ------------------------------------------------------------
-# short plain-English helpers for the card
-# ------------------------------------------------------------
 
 def funding_short(funding):
     if funding is None:
@@ -2300,7 +2373,7 @@ def macro_short(cross):
     return " | ".join(parts) if parts else "n/a"
 
 
-def trend_meaning(h1, h4, m15):
+def trend_meaning(h1, h4, m15, d1=None, w1=None):
     t4, t1 = h4.get("trend"), h1.get("trend")
     bull, bear = ("BULLISH", "WEAK BULLISH"), ("BEARISH", "WEAK BEARISH")
     if t4 in bull and t1 in bull:
@@ -2315,6 +2388,11 @@ def trend_meaning(h1, h4, m15):
         txt += " Short-term is pulling back inside the bigger uptrend."
     elif m15.get("trend") in bull and t4 in bear:
         txt += " Short-term is bouncing inside the bigger downtrend."
+    td, tw = (d1 or {}).get("trend"), (w1 or {}).get("trend")
+    if td in bull and tw in bull and t4 in bear:
+        txt += " Daily and weekly are still UP, so this looks like a pullback in a bigger uptrend."
+    elif td in bear and tw in bear and t4 in bull:
+        txt += " Daily and weekly are still DOWN, so this rise is a bounce in a bigger downtrend - be careful."
     return txt
 
 
@@ -2323,17 +2401,14 @@ def strength_stars(score):
     return "★" * n + "☆" * (5 - n)
 
 
-# ------------------------------------------------------------
-# SUMMARY CARD
-# ------------------------------------------------------------
-
 def build_card(state, update_delta=False):
     c = CTX
     ticker, tech = c.get("ticker") or {}, c.get("tech") or {}
     cross, news, events = c.get("cross") or {}, c.get("news") or [], c.get("events") or []
     bias, levels, plan = c["bias"], c.get("levels") or {}, c["plan"]
-    futures = c.get("futures") or {}
-    h1, h4, m15 = tech.get("1h") or {}, tech.get("4h") or {}, tech.get("15m") or {}
+    futures, kl = c.get("futures") or {}, c.get("keylevels") or {}
+    h1, h4, m15, d1 = (tech.get("1h") or {}, tech.get("4h") or {},
+                       tech.get("15m") or {}, tech.get("1d") or {})
     price = ticker.get("price") or levels.get("price")
     t = state.get("active_trade")
 
@@ -2347,13 +2422,17 @@ def build_card(state, update_delta=False):
         L.append("No new trade while this one is active.")
     elif plan["action"] in ("LONG", "SHORT"):
         icon = "🟢" if plan["action"] == "LONG" else "🔴"
-        L.append(B(f"{icon} VERDICT: {plan['action']} setup"))
+        n = (state.get("sig_streak") or {}).get("count", 0)
+        confirming = f" - confirming {n}/{SIGNAL_CONFIRM}" if n < SIGNAL_CONFIRM else ""
+        L.append(B(f"{icon} VERDICT: {plan['action']} setup{confirming}"))
         L.append(f"Setup strength: {strength_stars(bias['score'])}")
         L.append(f"Order: {'BUY' if plan['action'] == 'LONG' else 'SELL'} LIMIT at {esc(fmt_price(plan['entry']))}")
         L.append(f"Stop: {esc(fmt_price(plan['stop']))} | TP1: {esc(fmt_price(plan['tp1']))} | "
                  f"TP2: {esc(fmt_price(plan['tp2']))}")
-        L.append(f"Risk ${plan['risk_usd']:,.0f} → size ≈ {plan['size_btc']:.4f} BTC "
-                 f"(≈ ${plan['notional']:,.0f} position)")
+        L.append(f"Risk ${plan['risk_usd']:,.2f} → size ≈ {plan['size_btc']:.4f} BTC "
+                 f"(≈ ${plan['notional']:,.0f}, ~{plan.get('leverage', 0):.1f}x leverage)")
+        if plan.get("capped"):
+            L.append(f"⚠️ Size capped at {MAX_LEVERAGE:.0f}x leverage (stop is wide for your account).")
         L.append("Why: trend, momentum, volume and trend-strength filters all agree.")
     else:
         L.append(B("🟡 VERDICT: WAIT"))
@@ -2362,19 +2441,31 @@ def build_card(state, update_delta=False):
         L.append(f"Mood strength: {strength_stars(bias['score'])} ({esc(bias['bias'])})")
 
     # ---- quick read
+    stale_f = " (stale)" if "funding" in (futures.get("stale") or []) else ""
     L += ["",
           B("Quick read"),
-          f"Trend: 4h {arrow(h4.get('trend'))} | 1h {arrow(h1.get('trend'))} | 15m {arrow(m15.get('trend'))}",
+          f"Trend: 1d {arrow(d1.get('trend'))} | 4h {arrow(h4.get('trend'))} | "
+          f"1h {arrow(h1.get('trend'))} | 15m {arrow(m15.get('trend'))}",
           "Momentum: " + esc(momentum_words(h1.get("rsi"))),
-          "Crowd: " + esc(funding_short(futures.get("funding"))),
-          "Macro: " + esc(macro_short(cross)),
-          "News: " + esc(news_mood(news).replace("News mood: ", ""))]
+          "Crowd: " + esc(funding_short(futures.get("funding")) + stale_f),
+          "Macro: " + esc(macro_short(cross))]
+    extra = []
+    if (c.get("glob") or {}).get("btc_dom"):
+        extra.append(f"BTC dominance {c['glob']['btc_dom']:.1f}%")
+    if (c.get("options") or {}).get("pc_oi") is not None:
+        extra.append(f"options put/call {c['options']['pc_oi']:.2f}")
+    if extra:
+        L.append("Market: " + esc(" | ".join(extra)))
+    L.append("News: " + esc(news_mood(news).replace("News mood: ", "")))
 
     # ---- levels
     if levels:
         L += ["",
               f"🧭 Ceiling {esc(_dist(levels.get('resistance'), price))}",
               f"    Floor   {esc(_dist(levels.get('support'), price))}"]
+        if kl.get("vwap") and price:
+            L.append(f"    Today's VWAP {esc(fmt_price(kl['vwap']))} "
+                     f"(price is {'above' if price > kl['vwap'] else 'below'} it)")
         if not t and plan["action"] == "WAIT":
             L.append(f"LONG only above {esc(fmt_price(plan.get('trigger_long')))} | "
                      f"SHORT only below {esc(fmt_price(plan.get('trigger_short')))}")
@@ -2387,6 +2478,13 @@ def build_card(state, update_delta=False):
         when = f"{mins} min" if mins < 60 else f"{mins // 60}h {mins % 60}m"
         warn = " → avoid new trades" if mins <= NO_TRADE_BEFORE_EVENT_MIN else ""
         L += ["", f"⏰ Next big event: {esc(e['name'])} in {when}{warn}"]
+        rt = reaction_text(state, e["name"])
+        if rt:
+            L.append(esc(rt))
+
+    note = liquidity_note()
+    if note:
+        L += ["", "⚠️ " + esc(note)]
 
     # ---- what changed
     prev = state.get("last_card")
@@ -2401,41 +2499,46 @@ def build_card(state, update_delta=False):
     if update_delta and price:
         state["last_card"] = {"price": price, "bias": bias["bias"], "action": plan["action"]}
 
-    # ---- freshness + footer
     L += ["",
           f"<i>Data age: price {_age(HEALTH.get('price'))} | macro/news {_age(CTX.get('slow_ts'))}</i>",
           "<i>Tap a tab for details. Not advice - any trade can lose. The bot never places orders.</i>"]
     return "\n".join(L)
 
 
-# ------------------------------------------------------------
-# TABS
-# ------------------------------------------------------------
-
 def tab_trend(state):
     tech = CTX.get("tech") or {}
     L = [B("📈 TREND - which way is price heading?"), ""]
-    for tf, label in (("5m", "5 min "), ("15m", "15 min"), ("1h", "1 hour"), ("4h", "4 hour")):
+    for tf, label in (("5m", "5 min "), ("15m", "15 min"), ("1h", "1 hour"),
+                      ("4h", "4 hour"), ("1d", "1 day "), ("1w", "1 week")):
         s = tech.get(tf) or {}
+        if not s:
+            L.append(f"{esc(label)}: loading...")
+            continue
         L.append(f"{esc(label)}: {esc(trend_words(s.get('trend')))} | RSI {_num(s.get('rsi'))} "
                  f"| ADX {_num(s.get('adx'))}")
     h1, h4, m15 = tech.get("1h") or {}, tech.get("4h") or {}, tech.get("15m") or {}
-    L += ["", B("What it means"), esc(trend_meaning(h1, h4, m15)),
+    L += ["", B("What it means"),
+          esc(trend_meaning(h1, h4, m15, tech.get("1d"), tech.get("1w"))),
           "", "Strength: " + esc(trend_strength_words(h1.get("adx"))),
           "Momentum: " + esc(momentum_words(h1.get("rsi"))),
-          "", f"<i>Overall score {CTX['bias']['score']:+.1f} (needs ±2 for a mood, ±2 plus chart confirmation for a trade)</i>"]
+          "", f"<i>Overall score {CTX['bias']['score']:+.1f} (daily/weekly are shown for context; "
+              "the trade score uses 15m, 1h and 4h)</i>"]
     return "\n".join(L)
 
 
 def tab_futures(state):
     c = CTX
     fut = c.get("futures") or {}
-    L = [B("🎲 FUTURES - what the crowd is doing"), "",
+    L = [B("🎲 FUTURES & OPTIONS - what the crowd is doing"), "",
          "• " + esc(funding_words(fut.get("funding"))),
          "• " + esc(oi_words(fut)),
          "• " + esc(liq_words(fut))]
     L += ["• " + esc(x) for x in crowd_words(c.get("crowd"))]
-    L += ["• " + esc(fng_words(c.get("fng")))]
+    L += ["• " + esc(fng_words(c.get("fng"))),
+          "• " + esc(options_words(c.get("options")))]
+    if fut.get("stale"):
+        L += ["", "⚠️ Some values above are from a previous cycle (marked stale): "
+              + esc(", ".join(fut["stale"]))]
     L += ["", "<i>Extreme crowding is a contrarian warning, not a signal by itself.</i>"]
     return "\n".join(L)
 
@@ -2449,8 +2552,16 @@ def tab_macro(state):
          "• " + esc(cross_line("US10Y", cross.get("US10Y"), False, "US 10Y yield")),
          "• " + esc(cross_line("VIX", cross.get("VIX"), False, "Fear index (VIX)")),
          "• " + esc(cross_line("GOLD", cross.get("GOLD"), None, "Gold")),
+         "• " + esc(global_words(c.get("glob"))),
          "", B("⏰ Big events - next 7 days")]
-    L += [esc(x) for x in upcoming_events_text(c.get("events") or [])]
+    events = c.get("events") or []
+    L += [esc(x) for x in upcoming_events_text(events)]
+    seen = set()
+    for e in events:
+        rt = reaction_text(state, e["name"])
+        if rt and e["name"] not in seen and e["time"] >= now_utc() and len(seen) < 3:
+            seen.add(e["name"])
+            L.append("   " + esc(rt))
     return "\n".join(L)
 
 
@@ -2466,19 +2577,25 @@ def tab_news(state):
 
 def tab_levels(state):
     c = CTX
-    lv = c.get("levels") or {}
+    lv, kl = c.get("levels") or {}, c.get("keylevels") or {}
     if not lv:
         return "Levels not available yet."
     p = lv["price"]
     L = [B("🧭 KEY LEVELS"), "",
          f"Ceiling (resistance): {esc(_dist(lv.get('resistance'), p))}",
          f"Floor (support):      {esc(_dist(lv.get('support'), p))}",
-         f"Normal 1h swing: ±{esc(fmt_price(lv['atr']))} (±{lv['atr_pct']:.2f}%)",
-         "", B("Scenarios"),
-         f"🟢 If price breaks UP with volume: next stops {esc(fmt_price(lv['bull1']))}, then {esc(fmt_price(lv['bull2']))}",
-         f"🔴 If price breaks DOWN: next stops {esc(fmt_price(lv['bear1']))}, then {esc(fmt_price(lv['bear2']))}",
-         "↔️ If it stays between floor and ceiling: range - trend trades often fail.",
-         "", "<i>A break only counts if a candle CLOSES beyond the level. Wicks often reverse.</i>"]
+         f"Normal 1h swing: ±{esc(fmt_price(lv['atr']))} (±{lv['atr_pct']:.2f}%)"]
+    names = [("vwap", "Today's VWAP"), ("day_open", "Today's open"), ("prev_high", "Yesterday high"),
+             ("prev_low", "Yesterday low"), ("week_open", "This week's open"),
+             ("prev_week_high", "Last week high"), ("prev_week_low", "Last week low")]
+    rows = [f"{esc(label)}: {esc(_dist(kl.get(k), p))}" for k, label in names if kl.get(k)]
+    if rows:
+        L += ["", B("Reference levels (where traders react)")] + rows
+    L += ["", B("Scenarios"),
+          f"🟢 If price breaks UP with volume: next stops {esc(fmt_price(lv['bull1']))}, then {esc(fmt_price(lv['bull2']))}",
+          f"🔴 If price breaks DOWN: next stops {esc(fmt_price(lv['bear1']))}, then {esc(fmt_price(lv['bear2']))}",
+          "↔️ If it stays between floor and ceiling: range - trend trades often fail.",
+          "", "<i>A break only counts if a candle CLOSES beyond the level. Wicks often reverse.</i>"]
     return "\n".join(L)
 
 
@@ -2488,7 +2605,7 @@ def tab_stats(state):
     t = state.get("active_trade")
     if t:
         L += ["", B("Current trade")] + [esc(x) for x in active_trade_lines(t, (CTX.get("ticker") or {}).get("price"))]
-    L += ["", "<i>Fewer than ~100 trades is too small a sample to trust the win rate.</i>"]
+    L += ["", "<i>Costs included: maker/taker fees and slippage. Use /export to download every trade.</i>"]
     return "\n".join(L)
 
 
@@ -2499,10 +2616,14 @@ def tab_glossary(state):
         "<b>RSI</b> - momentum 0-100. Above 70 = stretched up, below 30 = stretched down.",
         "<b>ADX</b> - trend STRENGTH. Below 18 = choppy sideways market.",
         "<b>ATR</b> - normal swing size; used for stop distance.",
+        "<b>VWAP</b> - average price paid today, weighted by volume. Above = buyers in control.",
         "<b>Support / Resistance</b> - floor / ceiling where price often reacts.",
         "<b>Funding</b> - fee between longs and shorts. High = crowd is too long.",
         "<b>Open interest (OI)</b> - total open futures bets. Rising = new money entering.",
+        "<b>Put/call ratio</b> - puts are bets on a fall, calls on a rise. Above 1 = more put bets.",
+        "<b>Implied volatility</b> - how big a move the options market expects.",
         "<b>Liquidation</b> - forced closing of a leveraged position.",
+        "<b>Leverage</b> - position size divided by your account. 3x = a position 3 times your money.",
         "<b>Limit order</b> - waits for your price instead of buying at once.",
         "<b>R</b> - your risk on one trade. +2R = won twice what you risked.",
         "<b>TP1 / TP2</b> - take-profit levels. At TP1 close half, stop to breakeven.",
@@ -2525,8 +2646,7 @@ def build_tab(tab, state):
 
 
 def send_card(state):
-    CTX["details"] = None
-    tg_send_html(build_card(state, update_delta=True), tab_keyboard("summary"))
+    tg_send_html(localize(build_card(state, update_delta=True), state), tab_keyboard("summary"))
 
 
 def handle_tab_callback(state, cq):
@@ -2534,14 +2654,345 @@ def handle_tab_callback(state, cq):
     if not CTX.get("bias"):
         return
     msg = cq.get("message") or {}
-    tg_post("editMessageText", {
+    text = localize(build_tab(tab, state), state)
+    payload = {
         "chat_id": msg.get("chat", {}).get("id"),
         "message_id": msg.get("message_id"),
-        "text": build_tab(tab, state),
+        "text": text[:4000],
         "parse_mode": "HTML",
         "disable_web_page_preview": "true",
         "reply_markup": json.dumps(tab_keyboard(tab)),
-    })
+    }
+    if tg_post("editMessageText", payload) is None:
+        # bad markup (e.g. after translation) -> retry as plain text
+        payload.pop("parse_mode")
+        payload["text"] = _plain(text)[:4000]
+        tg_post("editMessageText", payload)
+
+
+def _track(url, ok):
+    try:
+        host = urlparse(url).netloc
+    except Exception:
+        return
+    h = SOURCE_HEALTH.setdefault(host, {"ok": 0, "fail": 0})
+    h["ok" if ok else "fail"] += 1
+
+
+SLOW_TFS = {"1d": 900, "1w": 3600}   # seconds between refreshes of slow timeframes
+
+
+def _compile_words(words):
+    return [re.compile(r"\b" + re.escape(w) + r"(?:s|es)?\b", re.I) for w in words]
+
+
+_HIGH_RX = _compile_words([
+    "fed", "federal reserve", "fomc", "rate hike", "rate cut",
+    "interest rate", "cpi", "pce", "ppi", "nonfarm", "payroll",
+    "unemployment", "jobs report", "treasury", "yield",
+    "etf", "sec", "regulation", "ban", "banned", "approval", "hack", "hacked",
+    "liquidation", "war", "sanction", "tariff", "china",
+    "bitcoin reserve", "sovereign", "default", "recession",
+])
+
+
+_BULL_RX = _compile_words([
+    "etf inflow", "inflow", "approval", "approved", "adoption",
+    "reserve", "rate cut", "cuts rates", "dovish", "easing",
+    "liquidity", "stimulus", "buying", "accumulation",
+    "bullish", "breakout", "surge", "surged", "soared", "rally", "rallied", "record inflow",
+])
+
+
+_BEAR_RX = _compile_words([
+    "etf outflow", "outflow", "rejected", "ban", "banned", "hack", "hacked",
+    "rate hike", "hikes rates", "hawkish", "tightening",
+    "liquidation", "selling", "sell-off", "bearish", "crash", "crashed",
+    "sanction", "tariff", "inflation", "yields rise",
+])
+
+
+def _ff_ttl():
+    now = now_utc()
+    for e in FF_CACHE.get("events") or []:
+        mins = (e["time"] - now).total_seconds() / 60
+        if -45 <= mins <= 60:
+            return 240      # near an event: refresh often so results show up quickly
+    return 1800             # otherwise be gentle with the rate limit
+
+
+def signal_features(bias, plan):
+    """Snapshot of every input at signal time, so the REAL (live) system can be evaluated later."""
+    c = CTX
+    tech, fut = c.get("tech") or {}, c.get("futures") or {}
+    cross, crowd = c.get("cross") or {}, c.get("crowd") or {}
+    h1, m15 = tech.get("1h") or {}, tech.get("15m") or {}
+    try:
+        return {
+            "score": round(bias["score"], 2), "bias": bias["bias"], "reasons": bias.get("reasons"),
+            "t15": m15.get("trend"), "t1h": h1.get("trend"),
+            "t4h": (tech.get("4h") or {}).get("trend"),
+            "t1d": (tech.get("1d") or {}).get("trend"),
+            "t1w": (tech.get("1w") or {}).get("trend"),
+            "adx_1h": h1.get("adx"), "rsi_1h": h1.get("rsi"),
+            "volratio_15m": m15.get("volume_ratio"), "atr_pct_1h": h1.get("atr_pct"),
+            "funding": fut.get("funding"), "oi_change_pct": fut.get("oi_change_pct"),
+            "fng": (c.get("fng") or {}).get("value"),
+            "taker_buy": crowd.get("taker_buy_ratio"), "ls_ratio": crowd.get("ls_ratio"),
+            "dxy": (cross.get("DXY") or {}).get("change"),
+            "nasdaq": (cross.get("NASDAQ") or {}).get("change"),
+            "us10y": (cross.get("US10Y") or {}).get("change"),
+            "vix": (cross.get("VIX") or {}).get("change"),
+            "options_pc_oi": (c.get("options") or {}).get("pc_oi"),
+            "btc_dominance": (c.get("glob") or {}).get("btc_dom"),
+            "leverage": plan.get("leverage"),
+        }
+    except Exception:
+        traceback.print_exc()
+        return {}
+
+
+def log_trade_features(t):
+    try:
+        with open(FEATURE_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(t, default=str) + "\n")
+    except Exception:
+        traceback.print_exc()
+
+
+def backtest_extras(ind, trades, warm):
+    first, last = float(ind["close"].iloc[warm]), float(ind["close"].iloc[-1])
+    bh = (last - first) / first * 100
+    s = trade_stats(trades)
+    if s["n"]:
+        print(f"Buy & hold BTC: {bh:+.1f}%  |  Strategy at {RISK_PCT_DEFAULT:.0f}% risk/trade "
+              f"(not compounded): {s['total_r'] * RISK_PCT_DEFAULT:+.1f}%")
+    closed = [t for t in trades if t.get("status") == "CLOSED" and t.get("result_r") is not None]
+    by_month = {}
+    for t in closed:
+        m = datetime.fromtimestamp(t["closed_at"], UTC).strftime("%Y-%m")
+        by_month.setdefault(m, []).append(t["result_r"])
+    if by_month:
+        print("\nMonthly results (R):")
+        for m in sorted(by_month):
+            rs = by_month[m]
+            print(f"  {m}: {len(rs):3d} trades | {sum(1 for r in rs if r > 0) / len(rs) * 100:3.0f}% wins "
+                  f"| {sum(rs):+6.2f}R")
+    if len(closed) >= 20:
+        half = len(closed) // 2
+        for name, part in (("First half", closed[:half]), ("Second half", closed[half:])):
+            rs = [t["result_r"] for t in part]
+            print(f"{name}: {len(rs)} trades | {sum(1 for r in rs if r > 0) / len(rs) * 100:.0f}% wins "
+                  f"| {sum(rs):+.2f}R  (big gap between halves = unstable strategy)")
+    if s["n"] < 100:
+        print(f"\n⚠️ Only {s['n']} trades - statistically weak. Test a longer period before trusting this.")
+    print("Costs included: maker fee on entry/TP, taker fee + slippage on stops.")
+
+
+LANG_NAMES = {"en": None,
+              "simple": "very simple English (short sentences, no jargon, explain terms in a few words)",
+              "ur": "Urdu (اردو), written in Urdu script"}
+
+
+def localize(text, state):
+    """Optional: rewrite a message in simple English or Urdu using Claude (needs ANTHROPIC_API_KEY)."""
+    lang = (state or {}).get("lang", "en")
+    if lang == "en" or lang not in LANG_NAMES or not ANTHROPIC_API_KEY:
+        return text
+    key = (lang, hashlib.sha1(text.encode("utf-8")).hexdigest())
+    if key in LANG_CACHE:
+        return LANG_CACHE[key]
+    out = claude_call(
+        "You rewrite Telegram messages. Keep every HTML tag (<b>, <i>) exactly as is, and keep all "
+        "numbers, prices, tickers, symbols and emojis unchanged. Output only the rewritten message.",
+        f"Rewrite this message in {LANG_NAMES[lang]}:\n\n{text}", max_tokens=1800)
+    if out:
+        if len(LANG_CACHE) > 40:
+            LANG_CACHE.clear()
+        LANG_CACHE[key] = out
+        return out
+    return text
+
+
+def record_price(state, price):
+    if not price:
+        return
+    h = state.setdefault("price_hist", [])
+    if h and time.time() - h[-1][0] < 50:
+        return
+    h.append([time.time(), price])
+
+
+def _price_near(hist, ts, tol=300):
+    best = None
+    for t, p in hist:
+        d = abs(t - ts)
+        if d <= tol and (best is None or d < best[0]):
+            best = (d, p)
+    return best[1] if best else None
+
+
+def update_event_reactions(state, events):
+    """30 minutes after each big event, store how far BTC moved (builds a personal history)."""
+    hist = state.get("price_hist") or []
+    react = state.setdefault("event_reactions", {})
+    now = time.time()
+    for e in events or []:
+        key = f"{e['id']}:REACT"
+        if state["event_alerts"].get(key):
+            continue
+        t0 = e["time"].timestamp()
+        if now < t0 + 35 * 60 or now > t0 + 3 * 3600:
+            continue
+        p0, p1 = _price_near(hist, t0), _price_near(hist, t0 + 30 * 60)
+        if p0 and p1:
+            lst = react.setdefault(e["name"], [])
+            lst.append({"t": t0, "pct": round((p1 - p0) / p0 * 100, 2)})
+            react[e["name"]] = lst[-8:]
+        state["event_alerts"][key] = now
+
+
+def reaction_text(state, name):
+    lst = ((state or {}).get("event_reactions") or {}).get(name) or []
+    if not lst:
+        return None
+    return (f"BTC after the last {min(3, len(lst))} '{name}': "
+            + ", ".join(f"{x['pct']:+.1f}%" for x in lst[-3:]) + " (30 min later)")
+
+
+def get_key_levels():
+    out = {}
+    d1, w1, m5 = CANDLES.get("1d"), CANDLES.get("1w"), CANDLES.get("5m")
+    try:
+        if d1 is not None and len(d1) >= 3:
+            out["day_open"] = safe_float(d1.iloc[-1]["open"])
+            out["prev_high"] = safe_float(d1.iloc[-2]["high"])
+            out["prev_low"] = safe_float(d1.iloc[-2]["low"])
+        if w1 is not None and len(w1) >= 3:
+            out["week_open"] = safe_float(w1.iloc[-1]["open"])
+            out["prev_week_high"] = safe_float(w1.iloc[-2]["high"])
+            out["prev_week_low"] = safe_float(w1.iloc[-2]["low"])
+        if m5 is not None and len(m5) > 20:
+            midnight = int(datetime.now(UTC).replace(hour=0, minute=0, second=0,
+                                                     microsecond=0).timestamp() * 1000)
+            day = m5[m5["time"] >= midnight]
+            if len(day) >= 3 and day["volume"].sum() > 0:
+                tp = (day["high"] + day["low"] + day["close"]) / 3
+                out["vwap"] = float((tp * day["volume"]).sum() / day["volume"].sum())
+    except Exception:
+        traceback.print_exc()
+    return out
+
+
+def get_global_market():
+    if time.time() - GLOBAL_CACHE["ts"] < 600 and GLOBAL_CACHE["data"]:
+        return GLOBAL_CACHE["data"]
+    d = http_json(COINGECKO + "/api/v3/global")
+    try:
+        g = d["data"]
+        GLOBAL_CACHE.update(ts=time.time(), data={
+            "btc_dom": safe_float(g["market_cap_percentage"]["btc"]),
+            "mcap_change": safe_float(g.get("market_cap_change_percentage_24h_usd"))})
+    except Exception:
+        pass
+    return GLOBAL_CACHE["data"]
+
+
+def get_options_context():
+    """Deribit public data: put/call ratio and implied volatility near the money."""
+    if time.time() - OPT_CACHE["ts"] < 600 and OPT_CACHE["data"]:
+        return OPT_CACHE["data"]
+    d = http_json(DERIBIT + "/api/v2/public/get_book_summary_by_currency",
+                  {"currency": "BTC", "kind": "option"}, timeout=20)
+    rows = (d or {}).get("result") or []
+    if not rows:
+        return OPT_CACHE["data"]
+    c_oi = p_oi = c_vol = p_vol = iv_w = iv_oi = 0.0
+    for r in rows:
+        name = str(r.get("instrument_name", ""))
+        oi = safe_float(r.get("open_interest"), 0) or 0
+        vol = safe_float(r.get("volume"), 0) or 0
+        if name.endswith("-C"):
+            c_oi += oi
+            c_vol += vol
+        elif name.endswith("-P"):
+            p_oi += oi
+            p_vol += vol
+        else:
+            continue
+        iv, und = safe_float(r.get("mark_iv")), safe_float(r.get("underlying_price"))
+        try:
+            strike = float(name.split("-")[2])
+        except Exception:
+            continue
+        if iv and und and oi > 0 and abs(strike / und - 1) <= 0.10:
+            iv_w += iv * oi
+            iv_oi += oi
+    if c_oi <= 0:
+        return OPT_CACHE["data"]
+    data = {"pc_oi": p_oi / c_oi,
+            "pc_vol": (p_vol / c_vol) if c_vol > 0 else None,
+            "iv": (iv_w / iv_oi) if iv_oi > 0 else None}
+    OPT_CACHE.update(ts=time.time(), data=data)
+    return data
+
+
+def options_words(opt):
+    if not opt:
+        return "Options: data unavailable this cycle"
+    pc = opt["pc_oi"]
+    mood = ("far more puts than calls -> traders are hedging / betting on a drop" if pc > 1.2 else
+            "slightly more puts than calls" if pc > 0.9 else
+            "far more calls than puts -> traders are betting on a rise" if pc < 0.6 else
+            "balanced puts and calls")
+    txt = f"Options put/call (open interest): {pc:.2f} -> {mood}"
+    if opt.get("iv"):
+        iv = opt["iv"]
+        txt += (f"\n• Implied volatility ~{iv:.0f}% -> "
+                + ("calm, options market expects small moves" if iv < 40 else
+                   "normal" if iv < 60 else "high, options market expects big moves"))
+    return txt
+
+
+def global_words(g):
+    if not g:
+        return "Crypto market: data unavailable this cycle"
+    txt = f"BTC dominance: {g['btc_dom']:.1f}%"
+    if g.get("mcap_change") is not None:
+        txt += f" | whole crypto market 24h: {g['mcap_change']:+.1f}%"
+    txt += (" -> money is flowing into BTC vs altcoins" if g["btc_dom"] and g["btc_dom"] > 58 else
+            " -> altcoins are getting a larger share" if g["btc_dom"] and g["btc_dom"] < 50 else "")
+    return txt
+
+
+def liquidity_note():
+    n = now_utc()
+    if n.weekday() >= 5:
+        return "Weekend: thinner liquidity, fake breakouts and sudden wicks are more common."
+    return None
+
+
+def health_text():
+    lines = ["🩺 DATA SOURCES (this session)"]
+    if not SOURCE_HEALTH:
+        lines.append("No requests made yet.")
+    for host, h in sorted(SOURCE_HEALTH.items()):
+        tot = h["ok"] + h["fail"]
+        rate = h["ok"] / tot * 100 if tot else 0
+        icon = "✅" if rate >= 90 else "⚠️" if rate >= 50 else "❌"
+        lines.append(f"{icon} {host}: {h['ok']}/{tot} ok")
+    lines.append(f"Liquidation websocket: {'connected (' + WS_STATE['source'] + ')' if WS_STATE['connected'] else 'not connected (REST fallback)'}")
+    return "\n".join(lines)
+
+
+def send_document(path, caption=""):
+    if not TOKEN or not CHAT_ID or not os.path.exists(path):
+        return False
+    with open(path, "rb") as f:
+        data = f.read()
+    res = tg_post("sendDocument", data={"chat_id": CHAT_ID, "caption": caption[:1000]},
+                  files={"document": (os.path.basename(path), data)}, timeout=60)
+    return bool(res and res.get("ok"))
 
 
 # ============================================================
@@ -2556,6 +3007,9 @@ HELP_TEXT = (
     "/stats   - track record (win rate, R)\n"
     "/chart   - chart with levels\n"
     "/glossary - explains RSI, ADX, funding...\n"
+    "/health  - which data sources are working\n"
+    "/export  - download trade history files\n"
+    "/lang en|simple|ur - message language\n"
     "/account 500 - set your account size in USD\n"
     "/risk 1  - risk per trade in % (0.1 - 3)\n"
     "/pause   - stop new signals\n"
@@ -2570,15 +3024,25 @@ def cmd_status(state):
         return
     price = (c.get("ticker") or {}).get("price")
     age = int((time.time() - HEALTH["price"]) / 60)
+    past = [e for e in (c.get("events") or [])
+            if e["time"] < now_utc() and (now_utc() - e["time"]).days < 7]
+    has_actual = any(e.get("actual") is not None for e in past) if past else None
+    results_line = ("n/a yet (no past events in feed)" if has_actual is None else
+                    "working" if has_actual else
+                    "NOT provided by the calendar source - only pre-event alerts will fire")
     lines = [f"📡 STATUS - {utc_text()}",
              f"BTC: {fmt_price(price)}",
              f"Mood: {c['bias']['bias']} (score {c['bias']['score']:+.1f})",
-             f"Signal now: {c['plan']['action']}",
+             f"Signal now: {c['plan']['action']} "
+             f"(confirming {(state.get('sig_streak') or {}).get('count', 0)}/{SIGNAL_CONFIRM})",
              f"Signals: {'PAUSED' if state.get('paused') else 'active'}",
-             f"Account: ${state['account']:,.0f} | Risk: {state['risk_pct']}% per trade",
+             f"Account: ${state['account']:,.0f} | Risk: {state['risk_pct']}% per trade "
+             f"| Max leverage: {MAX_LEVERAGE:.0f}x",
              f"Price data age: {age} min | Liquidation feed: "
              f"{'live websocket' if WS_STATE['connected'] else 'REST fallback'}",
-             f"Claude news: {'on' if ANTHROPIC_API_KEY else 'off (no ANTHROPIC_API_KEY)'}"]
+             f"Event results feed: {results_line}",
+             f"Claude news: {'on' if ANTHROPIC_API_KEY else 'off (no ANTHROPIC_API_KEY)'} "
+             f"| Language: {state.get('lang', 'en')}"]
     cd = state.get("cooldown_until", 0) - time.time()
     if cd > 0:
         lines.append(f"Cooldown: {cd / 60:.0f} min left")
@@ -2599,9 +3063,25 @@ def handle_command(state, cmd, args):
         else:
             send("No report yet. Send /report first.")
     elif cmd == "/glossary":
-        tg_send_html(build_tab("glossary", state), tab_keyboard("glossary"))
+        tg_send_html(localize(build_tab("glossary", state), state), tab_keyboard("glossary"))
     elif cmd == "/status":
         cmd_status(state)
+    elif cmd == "/health":
+        send(health_text())
+    elif cmd == "/export":
+        sent = False
+        for p, cap in ((TRADE_LOG_CSV, "All closed trades"), (FEATURE_LOG, "Signals with all inputs (JSON lines)")):
+            sent = send_document(p, cap) or sent
+        if not sent:
+            send("No trade files yet - they are created after the first closed trade.")
+    elif cmd == "/lang":
+        choice = args[0].lower() if args else ""
+        if choice in LANG_NAMES:
+            state["lang"] = choice
+            note = "" if (ANTHROPIC_API_KEY or choice == "en") else " (needs ANTHROPIC_API_KEY to translate)"
+            send(f"✅ Language set to {choice}{note}.")
+        else:
+            send("Usage: /lang en | simple | ur")
     elif cmd == "/trade":
         t = state.get("active_trade")
         send("\n".join(active_trade_lines(t, (CTX.get("ticker") or {}).get("price")))
@@ -2816,6 +3296,7 @@ def run_backtest_on_df(df15, verbose=True):
         s = trade_stats(trades)
         if s["n"]:
             print(f"Trades per month: {s['n'] / max(days / 30, 0.1):.1f}")
+        backtest_extras(ind, trades, warm)
         print("\nNOTE: past results do not guarantee future results. This excludes "
               "news/macro/futures factors and assumes the stop is hit first when "
               "stop and target are in the same candle.")
@@ -2862,7 +3343,7 @@ def send_startup(restart=False):
         send("🔄 Bot restarted after an error and is running again. Open trades are restored.")
         return
     send(
-        "₿ BTC MARKET BOT v3.1 STARTED\n"
+        "₿ BTC MARKET BOT v3.2 STARTED\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "• A clear action every 30 min: LONG / SHORT / WAIT\n"
         "• Headline card + tabs: Trend, Futures, Macro, News, Levels, Stats\n"
@@ -2885,7 +3366,7 @@ def run_bot(state, deadline, restart=False):
 
     t_fast = t_slow = t_cal = 0
     tech, futures, cross, news, events, ticker = {}, {}, {}, [], [], {}
-    fng, crowd = None, {}
+    fng, crowd, glob, opts = None, {}, None, None
     errors = 0
     CTX["state"] = state
 
@@ -2899,6 +3380,7 @@ def run_bot(state, deadline, restart=False):
                 ticker = get_btc_ticker()
                 if ticker.get("price"):
                     HEALTH["price"] = time.time()
+                    record_price(state, ticker["price"])
                 t_fast = now
 
             if now - t_slow >= SLOW_POLL_INTERVAL:
@@ -2906,6 +3388,8 @@ def run_bot(state, deadline, restart=False):
                 news = fetch_news()
                 fng = get_fear_greed()
                 crowd = get_crowd_context()
+                glob = get_global_market()
+                opts = get_options_context()
                 check_breaking_news(state, news)
                 CTX["slow_ts"] = time.time()
                 t_slow = now
@@ -2916,6 +3400,7 @@ def run_bot(state, deadline, restart=False):
                     events = new_events
                 t_cal = now
 
+            update_event_reactions(state, events)
             check_event_alerts(state, events)
             check_actual_event_changes(state, events)
             check_market_open_alerts(state)
@@ -2932,7 +3417,8 @@ def run_bot(state, deadline, restart=False):
                                         cooldown_min=cd_min, paused=state.get("paused", False))
                 CTX.update(ticker=ticker, tech=tech, futures=futures, cross=cross,
                            news=news, events=events, bias=bias, levels=levels,
-                           plan=plan, fng=fng, crowd=crowd)
+                           plan=plan, fng=fng, crowd=crowd, glob=glob, options=opts,
+                           keylevels=get_key_levels())
 
                 manage_active_trade(state, live_price)
                 process_signal(state, plan, bias, live_price)
