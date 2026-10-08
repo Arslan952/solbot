@@ -1,11 +1,13 @@
 import os
 import sys
 import io
+import re
 import csv
 import json
 import math
 import time
 import hashlib
+import html as _html
 import signal
 import threading
 import traceback
@@ -20,11 +22,11 @@ import requests
 
 
 # ============================================================
-# BTC MARKET INTELLIGENCE TELEGRAM BOT  (v3)
+# BTC MARKET INTELLIGENCE TELEGRAM BOT  (v3.1)
 # ------------------------------------------------------------
 #  1. Signal tracking: every LONG/SHORT is logged and followed
 #     until it hits stop / TP1 / TP2; win-rate + R stats
-#  2. Backtest:  python btc_market_bot.py --backtest 180
+#  2. Backtest:  python bot.py --backtest 180
 #  3. Better signals: ADX range filter, volume filter, cooldown
 #     after a loss, limit-pullback entries, volatility sizing
 #  4. Trade management messages (TP1 -> breakeven, trailing, ...)
@@ -34,6 +36,8 @@ import requests
 #     Claude summary (ANTHROPIC_API_KEY)
 #  7. Telegram commands/buttons/charts, crash alerts, health
 #     checks, atomic state saves
+#  8. NEW: headline card + tabs (Trend / Futures / Macro / News /
+#     Levels / Stats / Glossary) that edit one message in place
 #
 #  Signals are informational only. NO ORDERS ARE PLACED.
 # ============================================================
@@ -52,7 +56,7 @@ TRADE_LOG_CSV = os.environ.get("TRADE_LOG_CSV", "btc_trade_log.csv")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
 
-# "short" = compact summary + [Details] [Chart] buttons, "full" = everything
+# "short" = headline card + tabs, "full" = everything in one go
 REPORT_MODE = os.environ.get("REPORT_MODE", "short")
 CHART_WITH_REPORT = os.environ.get("CHART_WITH_REPORT", "0") == "1"
 ENABLE_LIQ_WS = os.environ.get("LIQ_WS", "1") == "1"
@@ -129,7 +133,7 @@ BEAR_TRENDS = ("BEARISH", "WEAK BEARISH")
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "BTC-Market-Intelligence-Bot/3.0",
+    "User-Agent": "BTC-Market-Intelligence-Bot/3.1",
     "Accept": "*/*",
 })
 
@@ -347,6 +351,7 @@ def default_state():
         "last_daily": "",
         "health_alert": False,
         "started_at": time.time(),
+        "last_card": None,
     }
 
 
@@ -2183,16 +2188,360 @@ def send_market_report(state):
     if not CTX.get("bias"):
         send("Still loading market data. Try again in a minute.")
         return
-    summary, details, full = build_report(state)
-    CTX["details"] = details
     if REPORT_MODE == "full":
+        summary, details, full = build_report(state)
+        CTX["details"] = details
         send(full)
     else:
-        send(summary, reply_markup=REPORT_BUTTONS)
+        send_card(state)
     if CHART_WITH_REPORT:
         png = make_chart()
         if png:
             send_photo(png, "BTC 15m chart")
+
+
+# ============================================================
+# REPORT UI  (headline card + tabs that edit one message)
+# ============================================================
+
+def esc(x):
+    return _html.escape(str(x), quote=False)
+
+
+def B(x):
+    return f"<b>{esc(x)}</b>"
+
+
+ARROWS = {"BULLISH": "⬆️", "WEAK BULLISH": "↗️", "NEUTRAL": "➡️",
+          "WEAK BEARISH": "↘️", "BEARISH": "⬇️"}
+
+
+def arrow(trend):
+    return ARROWS.get(trend, "➡️")
+
+
+def _num(x, fmt="{:.0f}", default="n/a"):
+    return default if x is None else fmt.format(x)
+
+
+def _age(ts):
+    if not ts:
+        return "n/a"
+    m = int((time.time() - ts) / 60)
+    return "just now" if m < 1 else f"{m} min ago"
+
+
+def _dist(level, price):
+    """'$68,100 (+1.0%)' - distance from current price."""
+    if level is None or not price:
+        return "n/a"
+    return f"{fmt_price(level)} ({(level - price) / price * 100:+.1f}%)"
+
+
+def tg_send_html(text, reply_markup=None):
+    """Send HTML; if Telegram rejects the markup, fall back to plain text."""
+    if not TOKEN or not CHAT_ID:
+        print("[Telegram not configured] ->\n" + _html.unescape(re.sub(r"<[^>]+>", "", text)) + "\n")
+        return None
+    data = {"chat_id": CHAT_ID, "text": text[:4000], "parse_mode": "HTML",
+            "disable_web_page_preview": "true"}
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
+    res = tg_post("sendMessage", data)
+    if not res or not res.get("ok"):
+        plain = _html.unescape(re.sub(r"<[^>]+>", "", text))
+        send(plain, reply_markup)
+    return res
+
+
+# ------------------------------------------------------------
+# tabs / buttons
+# ------------------------------------------------------------
+
+TAB_LABELS = {
+    "summary": "🏠 Summary", "trend": "📈 Trend", "futures": "🎲 Futures",
+    "macro": "🌍 Macro", "news": "📰 News", "levels": "🧭 Levels",
+    "stats": "📊 Stats", "glossary": "📖 Glossary",
+}
+
+
+def tab_keyboard(active="summary"):
+    btns = [{"text": ("• " if k == active else "") + label, "callback_data": f"tab:{k}"}
+            for k, label in TAB_LABELS.items()]
+    rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]
+    rows.append([{"text": "🖼 Chart", "callback_data": "chart"}])
+    return {"inline_keyboard": rows}
+
+
+# ------------------------------------------------------------
+# short plain-English helpers for the card
+# ------------------------------------------------------------
+
+def funding_short(funding):
+    if funding is None:
+        return "n/a"
+    f = funding * 100
+    mood = ("longs very crowded ⚠️" if f > 0.05 else "longs slightly ahead" if f > 0.01 else
+            "shorts very crowded ⚠️" if f < -0.05 else "shorts slightly ahead" if f < -0.01 else
+            "balanced")
+    return f"{mood} (funding {f:+.3f}%)"
+
+
+def macro_short(cross):
+    parts = []
+    dxy = (cross.get("DXY") or {}).get("change")
+    nq = (cross.get("NASDAQ") or {}).get("change")
+    if dxy is not None:
+        tag = "✅" if dxy < -0.15 else "❌" if dxy > 0.15 else "➖"
+        parts.append(f"Dollar {dxy:+.2f}% {tag}")
+    if nq is not None:
+        tag = "✅" if nq > 0.3 else "❌" if nq < -0.3 else "➖"
+        parts.append(f"Nasdaq {nq:+.2f}% {tag}")
+    return " | ".join(parts) if parts else "n/a"
+
+
+def trend_meaning(h1, h4, m15):
+    t4, t1 = h4.get("trend"), h1.get("trend")
+    bull, bear = ("BULLISH", "WEAK BULLISH"), ("BEARISH", "WEAK BEARISH")
+    if t4 in bull and t1 in bull:
+        txt = "Bigger charts agree on UP. Buying dips is safer than buying breakouts."
+    elif t4 in bear and t1 in bear:
+        txt = "Bigger charts agree on DOWN. Selling bounces is safer than selling breakdowns."
+    elif (t4 in bull and t1 in bear) or (t4 in bear and t1 in bull):
+        txt = "Timeframes disagree - this is how choppy, unreliable markets look. Be patient."
+    else:
+        txt = "No clear direction yet. Waiting is a position."
+    if m15.get("trend") in bear and t4 in bull:
+        txt += " Short-term is pulling back inside the bigger uptrend."
+    elif m15.get("trend") in bull and t4 in bear:
+        txt += " Short-term is bouncing inside the bigger downtrend."
+    return txt
+
+
+def strength_stars(score):
+    n = int(clamp(round(abs(score) / 4.5 * 5), 1, 5))
+    return "★" * n + "☆" * (5 - n)
+
+
+# ------------------------------------------------------------
+# SUMMARY CARD
+# ------------------------------------------------------------
+
+def build_card(state, update_delta=False):
+    c = CTX
+    ticker, tech = c.get("ticker") or {}, c.get("tech") or {}
+    cross, news, events = c.get("cross") or {}, c.get("news") or [], c.get("events") or []
+    bias, levels, plan = c["bias"], c.get("levels") or {}, c["plan"]
+    futures = c.get("futures") or {}
+    h1, h4, m15 = tech.get("1h") or {}, tech.get("4h") or {}, tech.get("15m") or {}
+    price = ticker.get("price") or levels.get("price")
+    t = state.get("active_trade")
+
+    L = [B(f"₿ BTC {fmt_price(price)}") + f"  (24h {esc(fmt_pct(ticker.get('change_24h')))})",
+         esc(utc_text()), "━━━━━━━━━━━━━━━━━━━━"]
+
+    # ---- verdict
+    if t:
+        L.append(B(f"📌 VERDICT: IN A {t['action']} TRADE"))
+        L += [esc(x) for x in active_trade_lines(t, price)]
+        L.append("No new trade while this one is active.")
+    elif plan["action"] in ("LONG", "SHORT"):
+        icon = "🟢" if plan["action"] == "LONG" else "🔴"
+        L.append(B(f"{icon} VERDICT: {plan['action']} setup"))
+        L.append(f"Setup strength: {strength_stars(bias['score'])}")
+        L.append(f"Order: {'BUY' if plan['action'] == 'LONG' else 'SELL'} LIMIT at {esc(fmt_price(plan['entry']))}")
+        L.append(f"Stop: {esc(fmt_price(plan['stop']))} | TP1: {esc(fmt_price(plan['tp1']))} | "
+                 f"TP2: {esc(fmt_price(plan['tp2']))}")
+        L.append(f"Risk ${plan['risk_usd']:,.0f} → size ≈ {plan['size_btc']:.4f} BTC "
+                 f"(≈ ${plan['notional']:,.0f} position)")
+        L.append("Why: trend, momentum, volume and trend-strength filters all agree.")
+    else:
+        L.append(B("🟡 VERDICT: WAIT"))
+        why = (plan.get("why") or ["No clear edge right now."])[0]
+        L.append("Why: " + esc(why))
+        L.append(f"Mood strength: {strength_stars(bias['score'])} ({esc(bias['bias'])})")
+
+    # ---- quick read
+    L += ["",
+          B("Quick read"),
+          f"Trend: 4h {arrow(h4.get('trend'))} | 1h {arrow(h1.get('trend'))} | 15m {arrow(m15.get('trend'))}",
+          "Momentum: " + esc(momentum_words(h1.get("rsi"))),
+          "Crowd: " + esc(funding_short(futures.get("funding"))),
+          "Macro: " + esc(macro_short(cross)),
+          "News: " + esc(news_mood(news).replace("News mood: ", ""))]
+
+    # ---- levels
+    if levels:
+        L += ["",
+              f"🧭 Ceiling {esc(_dist(levels.get('resistance'), price))}",
+              f"    Floor   {esc(_dist(levels.get('support'), price))}"]
+        if not t and plan["action"] == "WAIT":
+            L.append(f"LONG only above {esc(fmt_price(plan.get('trigger_long')))} | "
+                     f"SHORT only below {esc(fmt_price(plan.get('trigger_short')))}")
+
+    # ---- next event
+    nxt = upcoming_high_event(events, 7 * 24 * 60)
+    if nxt and nxt[1] > 0:
+        e, mins = nxt
+        mins = int(mins)
+        when = f"{mins} min" if mins < 60 else f"{mins // 60}h {mins % 60}m"
+        warn = " → avoid new trades" if mins <= NO_TRADE_BEFORE_EVENT_MIN else ""
+        L += ["", f"⏰ Next big event: {esc(e['name'])} in {when}{warn}"]
+
+    # ---- what changed
+    prev = state.get("last_card")
+    if prev and price and prev.get("price"):
+        ch = (price - prev["price"]) / prev["price"] * 100
+        bits = [f"price {ch:+.2f}%"]
+        bits.append("mood unchanged" if prev.get("bias") == bias["bias"]
+                    else f"mood {prev.get('bias')} → {bias['bias']}")
+        if prev.get("action") != plan["action"]:
+            bits.append(f"signal {prev.get('action')} → {plan['action']}")
+        L += ["", "🔄 Since last update: " + esc(", ".join(bits))]
+    if update_delta and price:
+        state["last_card"] = {"price": price, "bias": bias["bias"], "action": plan["action"]}
+
+    # ---- freshness + footer
+    L += ["",
+          f"<i>Data age: price {_age(HEALTH.get('price'))} | macro/news {_age(CTX.get('slow_ts'))}</i>",
+          "<i>Tap a tab for details. Not advice - any trade can lose. The bot never places orders.</i>"]
+    return "\n".join(L)
+
+
+# ------------------------------------------------------------
+# TABS
+# ------------------------------------------------------------
+
+def tab_trend(state):
+    tech = CTX.get("tech") or {}
+    L = [B("📈 TREND - which way is price heading?"), ""]
+    for tf, label in (("5m", "5 min "), ("15m", "15 min"), ("1h", "1 hour"), ("4h", "4 hour")):
+        s = tech.get(tf) or {}
+        L.append(f"{esc(label)}: {esc(trend_words(s.get('trend')))} | RSI {_num(s.get('rsi'))} "
+                 f"| ADX {_num(s.get('adx'))}")
+    h1, h4, m15 = tech.get("1h") or {}, tech.get("4h") or {}, tech.get("15m") or {}
+    L += ["", B("What it means"), esc(trend_meaning(h1, h4, m15)),
+          "", "Strength: " + esc(trend_strength_words(h1.get("adx"))),
+          "Momentum: " + esc(momentum_words(h1.get("rsi"))),
+          "", f"<i>Overall score {CTX['bias']['score']:+.1f} (needs ±2 for a mood, ±2 plus chart confirmation for a trade)</i>"]
+    return "\n".join(L)
+
+
+def tab_futures(state):
+    c = CTX
+    fut = c.get("futures") or {}
+    L = [B("🎲 FUTURES - what the crowd is doing"), "",
+         "• " + esc(funding_words(fut.get("funding"))),
+         "• " + esc(oi_words(fut)),
+         "• " + esc(liq_words(fut))]
+    L += ["• " + esc(x) for x in crowd_words(c.get("crowd"))]
+    L += ["• " + esc(fng_words(c.get("fng")))]
+    L += ["", "<i>Extreme crowding is a contrarian warning, not a signal by itself.</i>"]
+    return "\n".join(L)
+
+
+def tab_macro(state):
+    c = CTX
+    cross = c.get("cross") or {}
+    L = [B("🌍 MACRO - outside markets"), "",
+         "• " + esc(cross_line("DXY", cross.get("DXY"), False, "US Dollar (DXY)")),
+         "• " + esc(cross_line("NASDAQ", cross.get("NASDAQ"), True, "Nasdaq futures")),
+         "• " + esc(cross_line("US10Y", cross.get("US10Y"), False, "US 10Y yield")),
+         "• " + esc(cross_line("VIX", cross.get("VIX"), False, "Fear index (VIX)")),
+         "• " + esc(cross_line("GOLD", cross.get("GOLD"), None, "Gold")),
+         "", B("⏰ Big events - next 7 days")]
+    L += [esc(x) for x in upcoming_events_text(c.get("events") or [])]
+    return "\n".join(L)
+
+
+def tab_news(state):
+    news = CTX.get("news") or []
+    L = [B("📰 NEWS"), esc(news_mood(news)), ""]
+    ai = NEWS_AI_CACHE.get("text")
+    if ai:
+        L += [esc(ai), ""]
+    L += [esc(x) for x in format_news(news, state)]
+    return "\n".join(L)
+
+
+def tab_levels(state):
+    c = CTX
+    lv = c.get("levels") or {}
+    if not lv:
+        return "Levels not available yet."
+    p = lv["price"]
+    L = [B("🧭 KEY LEVELS"), "",
+         f"Ceiling (resistance): {esc(_dist(lv.get('resistance'), p))}",
+         f"Floor (support):      {esc(_dist(lv.get('support'), p))}",
+         f"Normal 1h swing: ±{esc(fmt_price(lv['atr']))} (±{lv['atr_pct']:.2f}%)",
+         "", B("Scenarios"),
+         f"🟢 If price breaks UP with volume: next stops {esc(fmt_price(lv['bull1']))}, then {esc(fmt_price(lv['bull2']))}",
+         f"🔴 If price breaks DOWN: next stops {esc(fmt_price(lv['bear1']))}, then {esc(fmt_price(lv['bear2']))}",
+         "↔️ If it stays between floor and ceiling: range - trend trades often fail.",
+         "", "<i>A break only counts if a candle CLOSES beyond the level. Wicks often reverse.</i>"]
+    return "\n".join(L)
+
+
+def tab_stats(state):
+    L = [B("📊 TRACK RECORD"), ""]
+    L += [esc(x) for x in stats_lines(state["trades"], "All time", state.get("account"))]
+    t = state.get("active_trade")
+    if t:
+        L += ["", B("Current trade")] + [esc(x) for x in active_trade_lines(t, (CTX.get("ticker") or {}).get("price"))]
+    L += ["", "<i>Fewer than ~100 trades is too small a sample to trust the win rate.</i>"]
+    return "\n".join(L)
+
+
+def tab_glossary(state):
+    return "\n".join([
+        B("📖 GLOSSARY"), "",
+        "<b>Trend</b> - direction price has been moving on that chart.",
+        "<b>RSI</b> - momentum 0-100. Above 70 = stretched up, below 30 = stretched down.",
+        "<b>ADX</b> - trend STRENGTH. Below 18 = choppy sideways market.",
+        "<b>ATR</b> - normal swing size; used for stop distance.",
+        "<b>Support / Resistance</b> - floor / ceiling where price often reacts.",
+        "<b>Funding</b> - fee between longs and shorts. High = crowd is too long.",
+        "<b>Open interest (OI)</b> - total open futures bets. Rising = new money entering.",
+        "<b>Liquidation</b> - forced closing of a leveraged position.",
+        "<b>Limit order</b> - waits for your price instead of buying at once.",
+        "<b>R</b> - your risk on one trade. +2R = won twice what you risked.",
+        "<b>TP1 / TP2</b> - take-profit levels. At TP1 close half, stop to breakeven.",
+        "<b>Setup strength</b> - how many signals agree. NOT a probability of winning.",
+    ])
+
+
+TAB_BUILDERS = {"summary": lambda s: build_card(s), "trend": tab_trend, "futures": tab_futures,
+                "macro": tab_macro, "news": tab_news, "levels": tab_levels,
+                "stats": tab_stats, "glossary": tab_glossary}
+
+
+def build_tab(tab, state):
+    fn = TAB_BUILDERS.get(tab, TAB_BUILDERS["summary"])
+    try:
+        return fn(state)[:3900]
+    except Exception:
+        traceback.print_exc()
+        return "Could not build this section right now. Try again in a minute."
+
+
+def send_card(state):
+    CTX["details"] = None
+    tg_send_html(build_card(state, update_delta=True), tab_keyboard("summary"))
+
+
+def handle_tab_callback(state, cq):
+    tab = cq.get("data", "tab:summary")[4:]
+    if not CTX.get("bias"):
+        return
+    msg = cq.get("message") or {}
+    tg_post("editMessageText", {
+        "chat_id": msg.get("chat", {}).get("id"),
+        "message_id": msg.get("message_id"),
+        "text": build_tab(tab, state),
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "true",
+        "reply_markup": json.dumps(tab_keyboard(tab)),
+    })
 
 
 # ============================================================
@@ -2206,6 +2555,7 @@ HELP_TEXT = (
     "/trade   - current trade\n"
     "/stats   - track record (win rate, R)\n"
     "/chart   - chart with levels\n"
+    "/glossary - explains RSI, ADX, funding...\n"
     "/account 500 - set your account size in USD\n"
     "/risk 1  - risk per trade in % (0.1 - 3)\n"
     "/pause   - stop new signals\n"
@@ -2244,7 +2594,12 @@ def handle_command(state, cmd, args):
     elif cmd == "/report":
         send_market_report(state)
     elif cmd == "/details":
-        send(CTX.get("details") or "No report yet. Send /report first.")
+        if CTX.get("bias"):
+            send_card(state)
+        else:
+            send("No report yet. Send /report first.")
+    elif cmd == "/glossary":
+        tg_send_html(build_tab("glossary", state), tab_keyboard("glossary"))
     elif cmd == "/status":
         cmd_status(state)
     elif cmd == "/trade":
@@ -2288,9 +2643,12 @@ def handle_update(state, u):
         chat = str(cq.get("message", {}).get("chat", {}).get("id", ""))
         if chat != str(CHAT_ID):
             return
-        if cq.get("data") == "details":
+        data = cq.get("data", "")
+        if data.startswith("tab:"):
+            handle_tab_callback(state, cq)
+        elif data == "details":
             handle_command(state, "/details", [])
-        elif cq.get("data") == "chart":
+        elif data == "chart":
             handle_command(state, "/chart", [])
         return
 
@@ -2504,14 +2862,15 @@ def send_startup(restart=False):
         send("🔄 Bot restarted after an error and is running again. Open trades are restored.")
         return
     send(
-        "₿ BTC MARKET BOT v3 STARTED\n"
+        "₿ BTC MARKET BOT v3.1 STARTED\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "• A clear action every 30 min: LONG / SHORT / WAIT\n"
+        "• Headline card + tabs: Trend, Futures, Macro, News, Levels, Stats\n"
         "• Limit-entry, stop-loss, TP1/TP2 and position size\n"
         "• Follow-up messages: fill, TP1 -> breakeven, trailing, exit\n"
         "• Instant alerts: trade setups, big news, market opens\n"
         "• Track record of every signal (/stats)\n\n"
-        "Type /help for commands.\n"
+        "Type /help for commands, /glossary for plain-English terms.\n"
         "⚠️ No guaranteed predictions. The bot never places trades."
     )
 
@@ -2548,6 +2907,7 @@ def run_bot(state, deadline, restart=False):
                 fng = get_fear_greed()
                 crowd = get_crowd_context()
                 check_breaking_news(state, news)
+                CTX["slow_ts"] = time.time()
                 t_slow = now
 
             if now - t_cal >= CALENDAR_POLL_INTERVAL:
