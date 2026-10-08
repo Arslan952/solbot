@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+bot.py.bak
+btc_market_state.json
+btc_market_state.json.tmp
+btc_trade_log.csv
+btc_signal_log.jsonl
+backtest_trades.csv
+backtest_report.txt
