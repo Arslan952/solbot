@@ -112,14 +112,14 @@ def test_leverage_cap():
 # ---------- signal persistence ----------
 def test_signal_needs_confirmation(monkeypatch=None):
     sent = []
-    bot.send = lambda msg, reply_markup=None: sent.append(msg) or True
+    bot.send = lambda msg, reply_markup=None, level="normal": sent.append(msg) or True
     bot.make_chart = lambda **k: None
     bot.CTX.clear()
     tech = _tech()
     bias = {"score": 3.0, "bias": "BULLISH", "confidence": 80, "reasons": []}
     plan = bot.build_trade_plan(bias, tech, bot.scenario_levels(tech, 67000), [], account=100000)
     state = bot.default_state()
-    for i in range(bot.SIGNAL_CONFIRM - 1):
+    for i in range(bot.confirm_needed() - 1):
         bot.process_signal(state, plan, bias, 67000)
         assert state["active_trade"] is None
     bot.process_signal(state, plan, bias, 67000)
