@@ -1,0 +1,9 @@
+services:
+  btc-bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SCAN_INTERVAL: "300"
+    volumes:
+      - ./data:/data
