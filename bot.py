@@ -23,7 +23,7 @@ import requests
 
 
 # ============================================================
-# BTC MARKET INTELLIGENCE TELEGRAM BOT  (v3.3)
+# BTC MARKET INTELLIGENCE TELEGRAM BOT  (v3.4)
 # ------------------------------------------------------------
 #  1. Signal tracking: every LONG/SHORT is logged and followed
 #     until it hits stop / TP1 / TP2; win-rate + R stats
@@ -143,7 +143,7 @@ BEAR_TRENDS = ("BEARISH", "WEAK BEARISH")
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "BTC-Market-Intelligence-Bot/3.3",
+    "User-Agent": "BTC-Market-Intelligence-Bot/3.4",
     "Accept": "*/*",
 })
 
@@ -201,7 +201,15 @@ def parse_number(value):
 
 
 def fmt_price(value):
-    return "unavailable" if value is None else f"${value:,.2f}"
+    """Price with sensible decimals (works for BTC and for $0.00001 coins)."""
+    if value is None:
+        return "unavailable"
+    a = abs(value)
+    if a >= 1:
+        return f"${value:,.2f}"
+    if a >= 0.01:
+        return f"${value:.4f}"
+    return f"${value:.8f}".rstrip("0") if a > 0 else "$0"
 
 
 def fmt_pct(value, decimals=2):
@@ -385,6 +393,10 @@ def default_state():
         "pump_alert_times": [],
         "pump_cooldown": {},
         "onboarded": False,
+        "scan": {},
+        "scan_log": [],
+        "listing_seen": [],
+        "digest": {"on": False, "hours": 3, "last": 0, "queue": []},
     }
 
 
@@ -427,7 +439,7 @@ def save_state(state):
 # PRICE DATA  (Binance -> OKX -> Coinbase)
 # ============================================================
 
-OKX_BAR = {"5m": "5m", "15m": "15m", "1h": "1H", "4h": "4H", "1d": "1Dutc", "1w": "1Wutc"}
+OKX_BAR = {"5m": "5m", "15m": "15m", "1h": "1H", "4h": "4H", "1d": "1Dutc", "1w": "1Wutc", "30m": "30m"}
 KLINE_COLS = ["time", "open", "high", "low", "close", "volume"]
 
 
@@ -2324,10 +2336,12 @@ MAJOR_PUMP_PCT = {"BTC": 2.0, "ETH": 3.0, "BNB": 3.0, "XRP": 4.0}
 
 
 BOT_COMMANDS = [
-    ("report", "Market card now"), ("why", "Why did a coin pump/dump? /why SOL"),
+    ("report", "Market card now"), ("scan", "Coins that may break out (technical + news)"),
+    ("analyze", "Chart analysis /analyze SOL 15m"), ("why", "Why did a coin pump/dump? /why SOL"),
     ("coin", "Quick analysis of any coin /coin SOL"), ("movers", "Top gainers and losers"),
     ("weekend", "Weekend / market-closed outlook"), ("plan", "Today's plan"),
     ("watch", "Watchlist /watch SOL ETH"), ("alert", "Price alerts /alert 70000"),
+    ("scanstats", "Scoreboard of past breakout picks"), ("digest", "Bundle alerts /digest on 3"),
     ("trade", "Current trade"), ("stats", "Track record"), ("status", "Bot status"),
     ("health", "Data source health"), ("tz", "Set timezone /tz Asia/Karachi"),
     ("quiet", "Quiet hours /quiet 00:00-07:00"), ("lang", "Language en|simple|ur"),
@@ -2464,6 +2478,11 @@ def _trim_state(state):
     state["alerts"] = (state.get("alerts") or [])[-20:]
     state["pump_cooldown"] = {k: v for k, v in (state.get("pump_cooldown") or {}).items()
                               if time.time() - v < 6 * 3600}
+    state["scan_log"] = (state.get("scan_log") or [])[-400:]
+    state["listing_seen"] = (state.get("listing_seen") or [])[-300:]
+    dg = state.get("digest")
+    if isinstance(dg, dict):
+        dg["queue"] = (dg.get("queue") or [])[-40:]
 
 
 def get_all_tickers():
@@ -2924,7 +2943,8 @@ def check_pump_dump(state):
                           f"Price {esc(fmt_price((tk.get(b) or {}).get('price')))} | 24h volume ${vol / 1e6:,.0f}M",
                           "Quick read: " + esc(reason), "",
                           "<i>Chasing a fast move is risky. Tap Why for the full check.</i>"])
-        tg_send_html(text, coin_buttons(b), level="normal")
+        notify(state, text, coin_buttons(b), level="normal",
+               digest_line=f"{icon} {b} {ch:+.1f}% in 1h - {esc(reason)}")
         cd[b] = now
         recent.append(now)
 
@@ -3603,6 +3623,12 @@ def handle_text(state, text):
     low = t.lower()
     if not t:
         return
+    if _SCORE_RX.search(low):
+        tg_send_html(scan_stats_text(state), None, level="normal")
+        return
+    if _SCAN_RX.search(low):
+        cmd_scan(state)
+        return
     if re.search(r"\b(weekend|saturday|sunday)\b|market.{0,12}(close|closed)|closed market", low):
         if CTX.get("bias"):
             tg_send_html(localize(weekend_text(state, "now"), state), None, level="normal")
@@ -3616,6 +3642,9 @@ def handle_text(state, text):
         handle_command(state, "/trade", [])
         return
     coin = detect_coin(t)
+    if _ANALYZE_RX.search(low):
+        cmd_analyze(state, [coin or "BTC", parse_tf(low) or "1h"])
+        return
     if not coin and _WHY_RX.search(low) and re.search(r"\b(market|crypto|everything|all coins)\b", low):
         coin = "BTC"
     if coin and _WHY_RX.search(low):
@@ -3655,6 +3684,1034 @@ def cmd_quiet(state, args):
         send(f"✅ Quiet hours {args[0]} ({state.get('tz', 'UTC')}). Only critical trade alerts will make a sound.")
     else:
         send("Usage: /quiet 00:00-07:00   or   /quiet off")
+
+
+# ============================================================
+# v3.4 FEATURES: chart analysis, breakout scanner, scoreboard, listings, digest
+# ============================================================
+
+TA_TFS = ["5m", "15m", "30m", "1h", "4h", "1d", "1w"]
+
+
+TA_HIGHER = {"5m": ["15m", "1h"], "15m": ["1h", "4h"], "30m": ["1h", "4h"], "1h": ["4h", "1d"],
+             "4h": ["1d", "1w"], "1d": ["1w"], "1w": []}
+
+
+TA_BUTTONS = ["5m", "15m", "1h", "4h", "1d"]
+
+
+def parse_tf(text):
+    """'15m', '1h', '4 hour', 'daily' ... -> one of TA_TFS (or None)."""
+    low = text.lower()
+    m = re.search(r"\b(\d+)\s?(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|wk|week|weeks)\b", low)
+    if m:
+        n, u = int(m.group(1)), m.group(2)
+        tf = f"{n}{'m' if u.startswith('m') else 'h' if u.startswith('h') else 'd' if u.startswith('d') else 'w'}"
+        if tf in TA_TFS:
+            return tf
+    for word, tf in (("daily", "1d"), ("weekly", "1w"), ("hourly", "1h")):
+        if word in low:
+            return tf
+    return None
+
+
+def find_pivots(df, k=3):
+    h, l = df["high"].values, df["low"].values
+    hi, lo = [], []
+    for i in range(k, len(df) - k):
+        if h[i] == h[i - k:i + k + 1].max():
+            hi.append((i, float(h[i])))
+        if l[i] == l[i - k:i + k + 1].min():
+            lo.append((i, float(l[i])))
+    return hi, lo
+
+
+def cluster_levels(vals, tol):
+    out = []
+    for v in sorted(vals):
+        if out and abs(v - out[-1][0]) <= tol:
+            lv, n = out[-1]
+            out[-1] = ((lv * n + v) / (n + 1), n + 1)
+        else:
+            out.append((v, 1))
+    return out
+
+
+def session_vwap(df):
+    midnight = int(datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+    day = df[df["time"] >= midnight]
+    if len(day) < 3 or day["volume"].sum() <= 0:
+        return None
+    tp = (day["high"] + day["low"] + day["close"]) / 3
+    return float((tp * day["volume"]).sum() / day["volume"].sum())
+
+
+def analyze_df(df, tf="1h"):
+    """Everything a technical analyst would read off one chart. Returns a plain dict."""
+    if df is None or len(df) < 60:
+        return None
+    if "rsi" not in df.columns:
+        df = add_indicators(df)
+    n = len(df)
+    closed = df.iloc[:-1]
+    price = float(df["close"].iloc[-1])
+    s = snapshot(closed.iloc[-1])
+    atr = s["atr"] or price * 0.01
+    hi, lo = find_pivots(closed, 3)
+    tol = 0.5 * atr
+
+    res = sorted(cluster_levels([p for _, p in hi[-12:] if p > price], tol), key=lambda x: x[0])[:2]
+    sup = sorted(cluster_levels([p for _, p in lo[-12:] if p < price], tol), key=lambda x: -x[0])[:2]
+    if not res:
+        rh = float(closed["high"].tail(50).max())
+        if rh > price:
+            res = [(rh, 1)]
+    if not sup:
+        rl = float(closed["low"].tail(50).min())
+        if rl < price:
+            sup = [(rl, 1)]
+
+    # --- volatility squeeze (Bollinger width at a low percentile, then expanding)
+    bbw = closed["bb_width"].dropna()
+    squeeze, release = False, None
+    if len(bbw) >= 40:
+        window = bbw.tail(100)
+        rank = float((window < window.iloc[-1]).mean() * 100)
+        was_tight = bool(window.tail(8).min() <= window.quantile(0.2))
+        squeeze = rank <= 20
+        if was_tight and rank > 20 and window.iloc[-1] > window.iloc[-3]:
+            ma20 = closed["close"].rolling(20).mean().iloc[-1]
+            release = "up" if closed["close"].iloc[-1] > ma20 else "down"
+
+    # --- RSI divergence on the last two pivots
+    div = None
+    if len(hi) >= 2 and hi[-1][0] > n - 45:
+        (i1, p1), (i2, p2) = hi[-2], hi[-1]
+        r1, r2 = closed["rsi"].iloc[i1], closed["rsi"].iloc[i2]
+        if p2 > p1 and r2 < r1 - 2:
+            div = "bearish"
+    if div is None and len(lo) >= 2 and lo[-1][0] > n - 45:
+        (i1, p1), (i2, p2) = lo[-2], lo[-1]
+        r1, r2 = closed["rsi"].iloc[i1], closed["rsi"].iloc[i2]
+        if p2 < p1 and r2 > r1 + 2:
+            div = "bullish"
+
+    # --- candle patterns on the last closed candle
+    o, c, h, l = (float(closed[k].iloc[-1]) for k in ("open", "close", "high", "low"))
+    po, pc, ph, pl = (float(closed[k].iloc[-2]) for k in ("open", "close", "high", "low"))
+    body, rng = abs(c - o), max(h - l, 1e-12)
+    lower, upper = min(o, c) - l, h - max(o, c)
+    patterns = []
+    if pc < po and c > o and c >= po and o <= pc:
+        patterns.append(("bullish", "bullish engulfing candle"))
+    if pc > po and c < o and c <= po and o >= pc:
+        patterns.append(("bearish", "bearish engulfing candle"))
+    if lower >= 2 * body and upper <= 0.3 * rng and body / rng < 0.4 and sup and (price - sup[0][0]) <= 1.5 * atr:
+        patterns.append(("bullish", "hammer / pin bar near support"))
+    if upper >= 2 * body and lower <= 0.3 * rng and body / rng < 0.4 and res and (res[0][0] - price) <= 1.5 * atr:
+        patterns.append(("bearish", "shooting star near resistance"))
+    if h <= ph and l >= pl:
+        patterns.append(("neutral", "inside bar (compression - breakout candle usually follows)"))
+
+    # --- structure
+    structure = None
+    if len(lo) >= 3 and lo[-1][1] > lo[-2][1] > lo[-3][1]:
+        structure = "higher lows (buyers stepping in earlier each dip)"
+    elif len(hi) >= 3 and hi[-1][1] < hi[-2][1] < hi[-3][1]:
+        structure = "lower highs (sellers capping each bounce)"
+
+    # --- range breakout / breakdown with volume
+    rh = float(closed["high"].iloc[-22:-2].max())
+    rl = float(closed["low"].iloc[-22:-2].min())
+    vr = s["volume_ratio"] or 1.0
+    brk = None
+    if c > rh:
+        brk = ("up", rh, vr)
+    elif c < rl:
+        brk = ("down", rl, vr)
+
+    # --- Fibonacci zones of the latest swing
+    fib = None
+    if hi and lo:
+        (ih, ph_), (il, pl_) = hi[-1], lo[-1]
+        if il > ih:      # latest swing is a drop: bounce zones
+            fib = {"leg": "down", "from": ph_, "to": pl_,
+                   "levels": {f: pl_ + f * (ph_ - pl_) for f in (0.382, 0.5, 0.618)}}
+        else:            # latest swing is a rise: pullback zones
+            fib = {"leg": "up", "from": pl_, "to": ph_,
+                   "levels": {f: ph_ - f * (ph_ - pl_) for f in (0.382, 0.5, 0.618)}}
+
+    vwap = session_vwap(df) if tf in ("5m", "15m", "30m", "1h", "4h") else None
+
+    # --- bias tally (each line = evidence)
+    pts, why = 0.0, []
+    tr = s["trend"]
+    tmap = {"BULLISH": 2, "WEAK BULLISH": 1, "BEARISH": -2, "WEAK BEARISH": -1}
+    if tr in tmap:
+        pts += tmap[tr]
+        why.append((tmap[tr], f"trend is {tr.lower()} (EMA 9/21/50 stack)"))
+    if vwap:
+        v = 1 if price > vwap else -1
+        pts += v
+        why.append((v, f"price {'above' if v > 0 else 'below'} today's VWAP"))
+    rsi = s["rsi"]
+    if rsi is not None:
+        if rsi > 55:
+            pts += 0.5
+            why.append((0.5, f"RSI {rsi:.0f} (buyers in control)"))
+        elif rsi < 45:
+            pts -= 0.5
+            why.append((-0.5, f"RSI {rsi:.0f} (sellers in control)"))
+    if div:
+        v = 1 if div == "bullish" else -1
+        pts += v
+        why.append((v, f"{div} RSI divergence (price and momentum disagree)"))
+    if release:
+        v = 1.5 if release == "up" else -1.5
+        pts += v
+        why.append((v, f"volatility squeeze released {release}ward"))
+    if brk:
+        v = 2 if brk[0] == "up" else -2
+        pts += v
+        why.append((v, f"closed {'above' if brk[0] == 'up' else 'below'} the 20-bar range ({fmt_price(brk[1])})"
+                       + (" on strong volume" if brk[2] >= 1.3 else " but volume is weak - fragile")))
+    for kind, label in patterns:
+        v = 1 if kind == "bullish" else -1 if kind == "bearish" else 0
+        pts += v
+        if v:
+            why.append((v, label))
+    if structure:
+        v = 1 if structure.startswith("higher") else -1
+        pts += v
+        why.append((v, structure))
+    label = "BULLISH" if pts >= 2.5 else "BEARISH" if pts <= -2.5 else "NEUTRAL / MIXED"
+
+    # --- scenarios
+    bull_trig = res[0][0] if res else rh
+    bull_inv = (sup[0][0] - 0.2 * atr) if sup else price - 1.5 * atr
+    bear_trig = sup[0][0] if sup else rl
+    bear_inv = (res[0][0] + 0.2 * atr) if res else price + 1.5 * atr
+    bull_active, bear_active = price > bull_trig, price < bear_trig      # move already under way
+    bref, sref = max(bull_trig, price), min(bear_trig, price)           # measure targets from here
+    bull_t = [res[1][0] if len(res) > 1 and res[1][0] > bref else bref + 1.5 * atr, bref + 3 * atr]
+    bear_t = [sup[1][0] if len(sup) > 1 and sup[1][0] < sref else sref - 1.5 * atr, sref - 3 * atr]
+
+    return {"tf": tf, "price": price, "snap": s, "atr": atr, "resistances": res, "supports": sup,
+            "squeeze": squeeze, "release": release, "div": div, "patterns": patterns,
+            "structure": structure, "breakout": brk, "range": (rl, rh), "fib": fib, "vwap": vwap,
+            "vol_ratio": vr, "bias_pts": pts, "bias": label, "why": sorted(why, key=lambda x: -abs(x[0])),
+            "bull": {"trigger": bull_trig, "invalid": bull_inv, "targets": bull_t, "active": bull_active},
+            "bear": {"trigger": bear_trig, "invalid": bear_inv, "targets": bear_t, "active": bear_active},
+            "pivots": {"hi": hi[-10:], "lo": lo[-10:]}, "n": n}
+
+
+def mtf_context(base, tf):
+    out = {}
+    for h in TA_HIGHER.get(tf, []):
+        df = add_indicators(get_klines(h, 200, base + "USDT"))
+        if len(df) >= 60:
+            s = snapshot(df.iloc[-2])
+            out[h] = {"trend": s["trend"], "rsi": s["rsi"], "adx": s["adx"]}
+    return out
+
+
+def render_coin_chart(df, base, tf, an):
+    """Candles + EMAs + VWAP + S/R zones + swings + scenario lines + volume + RSI -> PNG bytes."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+    if df is None or len(df) < 40 or not an:
+        return None
+    if "ema21" not in df.columns:
+        df = add_indicators(df)
+    N = min(120, len(df))
+    off = len(df) - N
+    d = df.tail(N).reset_index(drop=True)
+    fig, (ax, axv, axr) = plt.subplots(3, 1, figsize=(10, 7.4), dpi=110, sharex=True,
+                                       gridspec_kw={"height_ratios": [5, 1.3, 1.5]})
+    for i, r in d.iterrows():
+        col = "#16a34a" if r["close"] >= r["open"] else "#dc2626"
+        ax.vlines(i, r["low"], r["high"], color=col, linewidth=1)
+        ax.bar(i, max(abs(r["close"] - r["open"]), 1e-12), bottom=min(r["open"], r["close"]), width=0.6, color=col)
+        axv.bar(i, r["volume"], width=0.7, color=col, alpha=0.7)
+    for name, col in (("ema21", "#2563eb"), ("ema50", "#f59e0b"), ("ema200", "#7c3aed")):
+        if name in d and d[name].notna().any():
+            ax.plot(d[name], color=col, linewidth=1, label=name.upper())
+    if an.get("vwap") and tf in ("5m", "15m", "30m", "1h", "4h"):
+        ax.axhline(an["vwap"], color="#0ea5e9", linewidth=1, linestyle="-.", alpha=0.8)
+        ax.text(0, an["vwap"], " VWAP", color="#0ea5e9", fontsize=8, va="bottom")
+    atr = an["atr"]
+    for lvl, _ in an["resistances"]:
+        ax.axhspan(lvl - 0.25 * atr, lvl + 0.25 * atr, color="#dc2626", alpha=0.12)
+        ax.text(N - 1, lvl, f" R {fmt_price(lvl)}", color="#b91c1c", fontsize=8, va="bottom", ha="right")
+    for lvl, _ in an["supports"]:
+        ax.axhspan(lvl - 0.25 * atr, lvl + 0.25 * atr, color="#16a34a", alpha=0.12)
+        ax.text(N - 1, lvl, f" S {fmt_price(lvl)}", color="#15803d", fontsize=8, va="top", ha="right")
+    for i, p in an["pivots"]["hi"]:
+        if i - off >= 0:
+            ax.scatter(i - off, p, marker="v", color="#dc2626", s=18, zorder=5)
+    for i, p in an["pivots"]["lo"]:
+        if i - off >= 0:
+            ax.scatter(i - off, p, marker="^", color="#16a34a", s=18, zorder=5)
+    sc = an["bull"] if an["bias_pts"] >= -2.5 else an["bear"]
+    side = "bull" if an["bias_pts"] >= -2.5 else "bear"
+    ax.axhline(sc["trigger"], color="#16a34a" if side == "bull" else "#dc2626", linestyle="--", linewidth=1)
+    ax.axhline(sc["invalid"], color="#6b7280", linestyle=":", linewidth=1)
+    lab = ("Breakout level" if sc.get("active") else "Break above") if side == "bull" else \
+          ("Breakdown level" if sc.get("active") else "Break below")
+    ax.text(0, sc["trigger"], f" {lab} {fmt_price(sc['trigger'])}",
+            fontsize=8, va="bottom", color="#374151")
+    ax.text(0, sc["invalid"], f" Invalid {fmt_price(sc['invalid'])}", fontsize=8, va="top", color="#6b7280")
+    ax.set_title(f"{base}/USDT {tf}  |  {an['bias']}  |  {fmt_price(an['price'])}", fontsize=11)
+    ax.legend(loc="upper left", fontsize=8, ncol=3)
+    ax.grid(alpha=0.2)
+    axv.set_ylabel("Vol", fontsize=8)
+    axv.grid(alpha=0.2)
+    if "rsi" in d:
+        axr.plot(d["rsi"], color="#7c3aed", linewidth=1)
+        axr.axhline(70, color="#dc2626", linewidth=0.8, linestyle=":")
+        axr.axhline(30, color="#16a34a", linewidth=0.8, linestyle=":")
+        axr.set_ylim(10, 90)
+        axr.set_ylabel("RSI", fontsize=8)
+        axr.grid(alpha=0.2)
+    step = max(1, N // 8)
+    ticks = list(range(0, N, step))
+    axr.set_xticks(ticks)
+    axr.set_xticklabels([datetime.fromtimestamp(float(d["time"].iloc[i]) / 1000, USER_TZ["zone"]).strftime("%d %H:%M")
+                         for i in ticks], fontsize=7, rotation=0)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def analysis_html(base, tf, an, mtf, tk=None):
+    s = an["snap"]
+    bias_icon = {"BULLISH": "🟢", "BEARISH": "🔴"}.get(an["bias"], "🟡")
+    L = [B(f"📊 {base} {tf} CHART ANALYSIS"), esc(utc_text()),
+         f"Price {esc(fmt_price(an['price']))} | {bias_icon} Bias: <b>{esc(an['bias'])}</b> "
+         f"(evidence score {an['bias_pts']:+.1f})", "━━━━━━━━━━━━━━━━━━━━", "",
+         B("Trend & strength"),
+         f"• {arrow(s['trend'])} {esc(trend_words(s['trend']))} on {esc(tf)}",
+         f"• {esc(trend_strength_words(s.get('adx')))}",
+         f"• Momentum: {esc(momentum_words(s.get('rsi')))}"]
+    if an.get("structure"):
+        L.append("• Structure: " + esc(an["structure"]))
+    if mtf:
+        L += ["", B("Higher timeframes")]
+        for h, v in mtf.items():
+            L.append(f"• {esc(h)}: {arrow(v['trend'])} {esc(trend_words(v['trend']))} | RSI {_num(v['rsi'])}")
+        agree = [v["trend"] in ("BULLISH", "WEAK BULLISH") for v in mtf.values()]
+        own = s["trend"] in ("BULLISH", "WEAK BULLISH")
+        if all(a == own for a in agree):
+            L.append("→ All timeframes agree - cleaner setup.")
+        else:
+            L.append("→ Timeframes disagree - treat signals with extra caution.")
+
+    L += ["", B("Levels")]
+    for lvl, touches in an["resistances"]:
+        L.append(f"• Resistance {esc(fmt_price(lvl))} ({(lvl - an['price']) / an['price'] * 100:+.1f}%, "
+                 f"{touches} touch{'es' if touches > 1 else ''})")
+    for lvl, touches in an["supports"]:
+        L.append(f"• Support {esc(fmt_price(lvl))} ({(lvl - an['price']) / an['price'] * 100:+.1f}%, "
+                 f"{touches} touch{'es' if touches > 1 else ''})")
+    if an.get("vwap"):
+        L.append(f"• VWAP {esc(fmt_price(an['vwap']))} (price {'above' if an['price'] > an['vwap'] else 'below'})")
+    if an.get("fib"):
+        f = an["fib"]
+        zone = ", ".join(f"{k:.1%} {fmt_price(v)}" for k, v in f["levels"].items())
+        L.append(f"• Fibonacci {'pullback' if f['leg'] == 'up' else 'bounce'} zones: {esc(zone)}")
+
+    sig = []
+    if an["release"]:
+        sig.append(f"Volatility squeeze released {an['release']}ward")
+    elif an["squeeze"]:
+        sig.append("Tight squeeze - price is coiling, a bigger move is building (direction not decided)")
+    if an["div"]:
+        sig.append(f"{an['div'].capitalize()} RSI divergence")
+    if an["breakout"]:
+        d_, lvl, vr = an["breakout"]
+        sig.append(f"Closed {'above' if d_ == 'up' else 'below'} range {fmt_price(lvl)} "
+                   f"({'volume confirms' if vr >= 1.3 else 'volume weak'})")
+    sig += [p for _, p in an["patterns"]]
+    if an["vol_ratio"] and an["vol_ratio"] >= 2:
+        sig.append(f"Volume spike {an['vol_ratio']:.1f}x normal")
+    L += ["", B("Signals on the last candles")] + (["• " + esc(x) for x in sig] or ["• Nothing special - quiet chart"])
+
+    L += ["", B("Why the bias reads this way")]
+    L += [f"• {'+' if v > 0 else '−'} {esc(t)}" for v, t in an["why"][:6]] or ["• No strong evidence either way"]
+
+    bu, be = an["bull"], an["bear"]
+    bull_txt = (f"🟢 <b>Bullish (already under way):</b> price is above {esc(fmt_price(bu['trigger']))}. Healthy while "
+                f"retests hold that level; next targets {esc(fmt_price(bu['targets'][0]))}, {esc(fmt_price(bu['targets'][1]))}. "
+                f"Wrong if it closes below {esc(fmt_price(bu['invalid']))}." if bu.get("active") else
+                f"🟢 <b>Bullish:</b> a candle CLOSE above {esc(fmt_price(bu['trigger']))} → targets "
+                f"{esc(fmt_price(bu['targets'][0]))}, {esc(fmt_price(bu['targets'][1]))}. Wrong if it closes below {esc(fmt_price(bu['invalid']))}.")
+    bear_txt = (f"🔴 <b>Bearish (already under way):</b> price is below {esc(fmt_price(be['trigger']))}. Bounces into that level "
+                f"are being sold; next targets {esc(fmt_price(be['targets'][0]))}, {esc(fmt_price(be['targets'][1]))}. "
+                f"Wrong if it closes above {esc(fmt_price(be['invalid']))}." if be.get("active") else
+                f"🔴 <b>Bearish:</b> a CLOSE below {esc(fmt_price(be['trigger']))} → targets "
+                f"{esc(fmt_price(be['targets'][0]))}, {esc(fmt_price(be['targets'][1]))}. Wrong if it closes above {esc(fmt_price(be['invalid']))}.")
+    L += ["", B("Scenarios"), bull_txt, bear_txt,
+          "", "<i>Technical read of past candles, not a prediction or advice. Wicks often fake breaks - wait for the close.</i>"]
+    return "\n".join(L)
+
+
+def tf_buttons(base, active=None):
+    row = [{"text": ("• " if t == active else "") + t, "callback_data": f"an:{base}:{t}"} for t in TA_BUTTONS]
+    return {"inline_keyboard": [row, [{"text": f"🔍 Why {base} moved", "callback_data": f"why:{base}"},
+                                      {"text": "🎯 Breakout scan", "callback_data": "scan"}]]}
+
+
+def cmd_analyze(state, args):
+    raw = args[0] if args else "BTC"
+    base = NAME_TO_SYM.get(raw.lower()) or raw.upper().lstrip("$")
+    tf = (args[1].lower() if len(args) > 1 else None)
+    if tf not in TA_TFS:
+        tf = parse_tf(" ".join(args[1:])) or "1h"
+    send(f"📊 Analysing {base} on {tf}...", level="low")
+    df = add_indicators(get_klines(tf, 300, base + "USDT"))
+    an = analyze_df(df, tf) if len(df) >= 60 else None
+    if not an:
+        send(f"Couldn't load enough {tf} candles for {base}. It must be a USDT pair on Binance/OKX.")
+        return
+    mtf = mtf_context(base, tf)
+    png = render_coin_chart(df, base, tf, an)
+    if png:
+        tg_send_photo(png, f"{base} {tf} | {an['bias']} | {fmt_price(an['price'])}", None, level="normal", html=False)
+    tg_send_html(localize(analysis_html(base, tf, an, mtf), state), tf_buttons(base, tf), level="normal")
+
+
+SCAN_ENABLED = os.environ.get("SCAN_ENABLED", "1") == "1"
+
+
+SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", "900"))
+
+
+SCAN_MIN_SCORE = float(os.environ.get("SCAN_MIN_SCORE", "60"))
+
+
+SCAN_TOP = int(os.environ.get("SCAN_TOP", "3"))
+
+
+SCAN_MAX_COINS = int(os.environ.get("SCAN_MAX_COINS", "50"))
+
+
+SCAN_MIN_VOL = float(os.environ.get("SCAN_MIN_VOL", "15000000"))
+
+
+SCAN_CACHE = {"ts": 0, "picks": [], "finalists": [], "danger": []}
+
+
+LEVEL_CACHE = {}
+
+
+EXCLUDE = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "USDE", "USD1", "XUSD", "BUSD", "EUR", "AEUR", "USDS",
+           "WBTC", "WBETH", "BETH", "STETH", "WSTETH", "BTCB", "PAXG", "XAUT", "UST", "EURI"}
+
+
+POS_TAGS = {"exchange listing": 8, "partnership / integration": 6, "upgrade / launch / airdrop": 6,
+            "burn / buyback": 4, "whale / large flows": 3, "ETF / regulation": 3}
+
+
+NEG_TAGS = {"delisting": -25, "token unlock": -12, "hack / exploit": -30}
+
+
+_RUMOR_RX = re.compile(r"\b(rumou?rs?|reportedly|unconfirmed|speculat\w+|could soon|may soon)\b", re.I)
+
+
+LIST_RX = re.compile(r"\b(will list|to list|lists|listing|adds? support|new listing|to add)\b", re.I)
+
+
+EXCH_RX = re.compile(r"\b(binance|coinbase|upbit|bybit|okx|kraken|robinhood)\b", re.I)
+
+
+def tg_send_photo(png, caption="", reply_markup=None, level="normal", html=True):
+    if not TOKEN or not CHAT_ID or not png:
+        return None
+    data = {"chat_id": CHAT_ID, "caption": caption[:1024]}
+    if html:
+        data["parse_mode"] = "HTML"
+    if _silent(level):
+        data["disable_notification"] = "true"
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
+    res = tg_post("sendPhoto", data=data, files={"photo": ("chart.png", png, "image/png")}, timeout=40)
+    if (not res or not res.get("ok")) and html:
+        data.pop("parse_mode")
+        data["caption"] = _plain(caption)[:1024]
+        res = tg_post("sendPhoto", data=data, files={"photo": ("chart.png", png, "image/png")}, timeout=40)
+    return (res.get("result") or {}).get("message_id") if res and res.get("ok") else None
+
+
+def tg_edit_caption(mid, caption, markup=None, html=True):
+    if not mid or not TOKEN:
+        return False
+    data = {"chat_id": CHAT_ID, "message_id": mid, "caption": caption[:1024]}
+    if html:
+        data["parse_mode"] = "HTML"
+    if markup:
+        data["reply_markup"] = json.dumps(markup)
+    res = tg_post("editMessageCaption", data)
+    if res is None and html:
+        data.pop("parse_mode")
+        data["caption"] = _plain(caption)[:1024]
+        res = tg_post("editMessageCaption", data)
+    return res is not None
+
+
+def quality_stars(score):
+    n = int(clamp(round(score / 20), 1, 5))
+    return "★" * n + "☆" * (5 - n)
+
+
+def scan_universe(tk, max_coins):
+    rows = [(b, v) for b, v in tk.items()
+            if b not in EXCLUDE and (v.get("quote_vol") or 0) >= SCAN_MIN_VOL
+            and v.get("change_24h") is not None and -8 <= v["change_24h"] <= 25 and v.get("price")]
+    rows.sort(key=lambda kv: -kv[1]["quote_vol"])
+    return rows[:max_coins]
+
+
+def score_breakout(df, df4=None, tk_row=None, btc_chg=None):
+    """Technical 'coiled spring' score (0-100) from the 1h chart (+4h context). Every point has a reason."""
+    if df is None or len(df) < 120:
+        return None
+    if "rsi" not in df.columns:
+        df = add_indicators(df)
+    an = analyze_df(df, "1h")
+    if not an:
+        return None
+    closed = df.iloc[:-1]
+    price, atr, s = an["price"], an["atr"], an["snap"]
+    pts, reasons, flags = 0.0, [], []
+    ch24 = (tk_row or {}).get("change_24h")
+
+    if an["release"] == "up":
+        pts += 20
+        reasons.append("1h volatility squeeze just released upward")
+    elif an["squeeze"]:
+        pts += 8
+        reasons.append("coiling in a tight 1h squeeze - a bigger move is building")
+    res = an["resistances"]
+    if an["breakout"] and an["breakout"][0] == "up":
+        pts += 15
+        reasons.append(f"closed above its 20-bar range ({fmt_price(an['breakout'][1])})"
+                       + (" with volume" if an["breakout"][2] >= 1.3 else " (volume still light)"))
+    elif res and 0 < (res[0][0] - price) / price <= 0.015:
+        pts += 15
+        reasons.append(f"pressing resistance {fmt_price(res[0][0])} ({(res[0][0] - price) / price * 100:.1f}% away)")
+
+    base_vol = float(closed["volume"].tail(23).head(20).mean())
+    vol3 = float(closed["volume"].tail(3).mean()) / base_vol if base_vol > 0 else 1.0
+    if vol3 >= 2.5:
+        pts += 15
+        reasons.append(f"volume building fast ({vol3:.1f}x normal over the last 3 hours)")
+    elif vol3 >= 1.5:
+        pts += 10
+        reasons.append(f"volume rising ({vol3:.1f}x normal)")
+
+    if ch24 is not None and btc_chg is not None:
+        rs = ch24 - btc_chg
+        if rs >= 3:
+            pts += 10
+            reasons.append(f"stronger than BTC today ({rs:+.1f} points)")
+        elif rs >= 1.5:
+            pts += 5
+            reasons.append(f"slightly stronger than BTC ({rs:+.1f} points)")
+
+    last = closed.iloc[-1]
+    if last["close"] > last["ema21"] > last["ema50"]:
+        pts += 10
+        reasons.append("price above rising 21/50 EMAs")
+    if last["ema50"] > last["ema200"]:
+        pts += 5
+    if an["structure"] and an["structure"].startswith("higher"):
+        pts += 5
+        reasons.append("higher lows - buyers stepping in earlier each dip")
+    adx_now, adx_prev = float(closed["adx"].iloc[-1]), float(closed["adx"].iloc[-6])
+    if 15 <= adx_now <= 28 and adx_now > adx_prev:
+        pts += 8
+        reasons.append(f"trend strength waking up (ADX {adx_prev:.0f} → {adx_now:.0f})")
+    rsi = s["rsi"]
+    if rsi is not None:
+        if 55 <= rsi <= 70:
+            pts += 8
+            reasons.append(f"momentum healthy (RSI {rsi:.0f})")
+        elif rsi > 75:
+            pts -= 15
+            flags.append(f"RSI {rsi:.0f} - overheated")
+        elif rsi > 70:
+            flags.append(f"RSI {rsi:.0f} getting hot")
+    if df4 is not None and len(df4) >= 60:
+        t4 = snapshot(df4.iloc[-2])["trend"]
+        if t4 in ("BULLISH", "WEAK BULLISH"):
+            pts += 8
+            reasons.append("4h trend is up")
+        elif t4 in ("BEARISH", "WEAK BEARISH"):
+            pts -= 10
+            flags.append("4h trend is down - fighting the bigger chart")
+    if ch24 is not None and ch24 > 20:
+        pts -= 15
+        flags.append(f"already up {ch24:.0f}% today - may be late")
+    g3 = closed.tail(3)
+    if (g3["close"] > g3["open"]).all() and (g3["close"].iloc[-1] / g3["open"].iloc[0] - 1) * 100 > 8 and vol3 > 3:
+        pts -= 20
+        flags.append("parabolic last 3 candles - blow-off risk")
+    if an["div"] == "bearish":
+        pts -= 10
+        flags.append("bearish RSI divergence")
+
+    trigger = an["bull"]["trigger"]
+    if an["breakout"] and an["breakout"][0] == "up":
+        trigger = an["breakout"][1]
+    return {"tech": clamp(pts, 0, 100), "reasons": reasons, "flags": flags, "price": price,
+            "trigger": trigger, "invalid": an["bull"]["invalid"], "targets": an["bull"]["targets"],
+            "an": an}
+
+
+def enrich_candidate(c):
+    """Add positioning (open interest / funding) and news points for a finalist."""
+    base = c["coin"]
+    d = coin_derivs(base)
+    items = coin_news(base)
+    dpts, npos, nneg = 0.0, 0.0, 0.0
+    news, nflags, dflags = [], [], []
+    oi = d.get("oi_change_6h") if d.get("oi_change_6h") is not None else d.get("oi_change_24h")
+    if oi is not None and oi >= 4 and abs(c.get("chg_6h") or 0) < 4:
+        dpts += 10
+        news.append(f"positions building: open interest {oi:+.0f}% while price is still flat")
+    f = d.get("funding")
+    if f is not None and f > 0.0005:
+        dpts -= 10
+        dflags.append(f"funding high ({f * 100:+.3f}%) - crowded longs")
+    elif f is not None and f < -0.0003:
+        dpts += 4
+        news.append(f"shorts are crowded (funding {f * 100:+.3f}%) - squeeze fuel")
+    text = " ".join(i["title"] for i in items)
+    blocked = False
+    for name, rx in _CAT_RX.items():
+        if not rx.search(text):
+            continue
+        if name in POS_TAGS:
+            npos += POS_TAGS[name]
+            news.append(f"headline catalyst: {name}")
+        if name in NEG_TAGS:
+            nneg += NEG_TAGS[name]
+            nflags.append(f"negative headline: {name}")
+            if name in ("hack / exploit", "delisting"):
+                blocked = True
+    if items and _RUMOR_RX.search(text):
+        nflags.append("headline wording is rumor / unconfirmed")
+    c.update(deriv_pts=dpts, news_pts=min(npos, 15) + nneg, news=news,
+             flags=c["flags"] + dflags + nflags, headlines=[i["title"][:100] for i in items[:2]],
+             funding=f, blocked=blocked, no_news=not items)
+
+
+def scan_danger(tk, limit=3):
+    rows = [(b, v) for b, v in tk.items() if b not in EXCLUDE and (v.get("quote_vol") or 0) >= SCAN_MIN_VOL
+            and (v.get("change_24h") or 0) >= 15]
+    rows.sort(key=lambda kv: -kv[1]["change_24h"])
+    out = []
+    for b, v in rows[:8]:
+        df = add_indicators(get_klines("1h", 120, b + "USDT"))
+        time.sleep(0.1)
+        if len(df) < 60:
+            continue
+        closed = df.iloc[:-1]
+        rsi = float(closed["rsi"].iloc[-1])
+        rs = []
+        if rsi >= 78:
+            rs.append(f"RSI {rsi:.0f} (extremely overheated)")
+        if v["change_24h"] >= 30:
+            rs.append(f"up {v['change_24h']:.0f}% in 24h")
+        last = closed.iloc[-1]
+        rng = max(float(last["high"] - last["low"]), 1e-12)
+        avg = float(closed["volume"].tail(21).head(20).mean())
+        if avg > 0 and float(last["volume"]) > 4 * avg and float(last["high"] - max(last["open"], last["close"])) > 0.5 * rng:
+            rs.append("volume climax with a long upper wick (buyers exhausted?)")
+        if rsi >= 70:
+            f = coin_derivs(b)["funding"]
+            if f is not None and f > 0.0008:
+                rs.append(f"funding {f * 100:+.3f}% - crowded longs")
+        if rs:
+            out.append({"coin": b, "chg": v["change_24h"], "rsi": rsi, "reasons": rs})
+    return out[:limit]
+
+
+def _pick_dict(c):
+    return {"coin": c["coin"], "price": c["price"], "total": round(c["total"], 1), "tech": round(c["tech"], 1),
+            "reasons": c["reasons"], "news": c.get("news", []), "flags": c["flags"][:4],
+            "trigger": c["trigger"], "invalid": c["invalid"], "targets": c["targets"],
+            "headlines": c.get("headlines", []), "chg_24h": (c.get("tk") or {}).get("change_24h"),
+            "no_news": c.get("no_news", False)}
+
+
+def run_scan(state, manual=False):
+    tk = tickers(max_age=60)
+    if not tk:
+        return None
+    btc_chg = (tk.get("BTC") or {}).get("change_24h")
+    cands = []
+    for b, v in scan_universe(tk, SCAN_MAX_COINS):
+        df = add_indicators(get_klines("1h", 200, b + "USDT"))
+        time.sleep(0.1)
+        sc = score_breakout(df, None, v, btc_chg)
+        if sc and sc["tech"] >= 35:
+            c = df["close"]
+            sc.update(coin=b, tk=v, df=df, chg_24h=v.get("change_24h"),
+                      chg_6h=pct_change(sc["price"], float(c.iloc[-7])) if len(c) > 8 else 0)
+            cands.append(sc)
+    cands.sort(key=lambda x: -x["tech"])
+    finalists = cands[:6]
+    for c in finalists:
+        df4 = add_indicators(get_klines("4h", 150, c["coin"] + "USDT"))
+        sc2 = score_breakout(c["df"], df4, c["tk"], btc_chg)
+        if sc2:
+            c.update(tech=sc2["tech"], reasons=sc2["reasons"], flags=sc2["flags"], an=sc2["an"],
+                     trigger=sc2["trigger"], invalid=sc2["invalid"], targets=sc2["targets"])
+        enrich_candidate(c)
+        c["total"] = clamp(c["tech"] + c["deriv_pts"] + c["news_pts"], 0, 100)
+    picks = sorted([c for c in finalists if c["total"] >= SCAN_MIN_SCORE and not c.get("blocked")],
+                   key=lambda x: -x["total"])[:SCAN_TOP]
+    danger = scan_danger(tk)
+    SCAN_CACHE.update(ts=time.time(), picks=picks, finalists=finalists, danger=danger)
+    scan = state.setdefault("scan", {})
+    scan.update(ts=time.time(), picks=[_pick_dict(p) for p in picks],
+                finalists=[_pick_dict(c) for c in finalists[:4]], danger=danger)
+    log_picks(state, picks)
+    update_scan_pin(state, picks)
+    return picks, finalists, danger
+
+
+def scan_caption(p):
+    for n_tech in (4, 3, 2, 1):
+        L = [B(f"🎯 BREAKOUT WATCH — {p['coin']}  {quality_stars(p['total'])}  (score {p['total']:.0f})"),
+             f"Price {esc(fmt_price(p['price']))} | 24h {_pct(p.get('chg_24h'))}", "",
+             B("Why technically")] + ["• " + esc(r) for r in p["reasons"][:n_tech]]
+        L += ["", B("News / positioning")]
+        L += (["• " + esc(r) for r in p["news"][:2]] if p["news"] else
+              ["• No catalyst found in the last 24h headlines" if p.get("no_news") or not p.get("headlines")
+               else "• Headlines found, no clear catalyst"])
+        L += ["", (f"✅ Holds above {esc(fmt_price(p['trigger']))} (breakout level)" if p["price"] > p["trigger"]
+                   else f"✅ Confirm: 1h CLOSE above {esc(fmt_price(p['trigger']))}")
+              + f"  |  ❌ Invalid below {esc(fmt_price(p['invalid']))}"]
+        if p["flags"]:
+            L.append("⚠️ " + esc("; ".join(p["flags"][:2])))
+        L.append(f"<i>Updated {esc(fmt_local(now_utc(), '%H:%M'))} · idea to watch, not a promise or order</i>")
+        cap = "\n".join(L)
+        if len(cap) <= 1000:
+            return cap
+    return cap[:1000]
+
+
+def _close_pin(state, text):
+    pin = (state.get("scan") or {}).get("pin")
+    if not pin:
+        return
+    (tg_edit_caption if pin.get("photo") else tg_edit)(pin["id"], B("⏹ BREAKOUT WATCH ended — " + pin["coin"]) + "\n" + esc(text), None)
+    unpin_message(pin["id"])
+    state["scan"]["pin"] = None
+
+
+def update_scan_pin(state, picks):
+    scan = state.setdefault("scan", {})
+    pin, tk = scan.get("pin"), TICKERS["data"]
+    top = picks[0] if picks else None
+    if pin:
+        px = (tk.get(pin["coin"]) or {}).get("price")
+        in_picks = any(p["coin"] == pin["coin"] for p in picks)
+        pin["misses"] = 0 if in_picks else pin.get("misses", 0) + 1
+        if time.time() - pin["ts"] > 24 * 3600:
+            _close_pin(state, "24 hours passed - the idea has run its course.")
+        elif px is not None and pin.get("invalid") and px < pin["invalid"]:
+            _close_pin(state, f"price fell below the invalidation level {fmt_price(pin['invalid'])} - the idea failed.")
+        elif top and top["coin"] != pin["coin"] and top["total"] >= pin["score"] + 8:
+            _close_pin(state, f"replaced by a stronger setup ({top['coin']}).")
+        elif pin["misses"] >= 3:
+            _close_pin(state, "conditions no longer meet the bar.")
+        pin = scan.get("pin")
+    if not top:
+        return
+    if pin and pin["coin"] == top["coin"]:
+        cap = scan_caption(top)
+        h = hashlib.sha1(cap.encode()).hexdigest()
+        if h != pin.get("hash"):
+            (tg_edit_caption if pin.get("photo") else tg_edit)(pin["id"], cap, tf_buttons(top["coin"], "1h"))
+            pin["hash"] = h
+        return
+    if pin:
+        return   # a weaker new pick does not replace the current pinned one
+    cap = scan_caption(top)
+    png = render_coin_chart(top["df"], top["coin"], "1h", top["an"])
+    mid = tg_send_photo(png, cap, tf_buttons(top["coin"], "1h"), level="normal") if png else None
+    photo = bool(mid)
+    if not mid:
+        mid = tg_send_html(cap, tf_buttons(top["coin"], "1h"), level="normal")
+    if mid:
+        pin_message(mid)
+        scan["pin"] = {"id": mid, "coin": top["coin"], "ts": time.time(), "invalid": top["invalid"],
+                       "score": top["total"], "photo": photo, "hash": hashlib.sha1(cap.encode()).hexdigest(), "misses": 0}
+        notify(state, scan_full_html(picks, SCAN_CACHE["finalists"], SCAN_CACHE["danger"]),
+               tab_keyboard("summary"), level="low", digest_line=f"🎯 Breakout watch: {top['coin']} (score {top['total']:.0f})")
+
+
+def scan_full_html(picks, finalists, danger):
+    L = [B("🎯 BREAKOUT SCAN"), esc(utc_text()),
+         "<i>Coins where technical AND news/positioning conditions often come before a bigger move. "
+         "A watch-list, not a prediction.</i>", ""]
+    if picks:
+        for i, p in enumerate(picks, 1):
+            L += [B(f"{i}. {p['coin']}  {quality_stars(p['total'])}  score {p['total']:.0f} (tech {p['tech']:.0f})"),
+                  f"Price {esc(fmt_price(p['price']))} | 24h {_pct(p.get('chg_24h'))}"]
+            L += ["• " + esc(r) for r in p["reasons"][:5]]
+            L += ["• " + esc(r) for r in p["news"][:3]]
+            for h in p.get("headlines", [])[:2]:
+                L.append("📰 " + esc(h))
+            L.append((f"✅ Holding above {esc(fmt_price(p['trigger']))} (breakout level) → targets " if p["price"] > p["trigger"]
+                      else f"✅ Confirm: 1h close above {esc(fmt_price(p['trigger']))} → targets ")
+                     + f"{esc(fmt_price(p['targets'][0]))}, {esc(fmt_price(p['targets'][1]))}")
+            L.append(f"❌ Invalid: below {esc(fmt_price(p['invalid']))}")
+            if p["flags"]:
+                L.append("⚠️ " + esc("; ".join(p["flags"])))
+            L.append("")
+    else:
+        L.append("No coin meets the bar right now - that is normal; most hours there is nothing clean.")
+        if finalists:
+            L += ["", B("Closest candidates (not strong enough)")]
+            for c in finalists[:3]:
+                L.append(f"• {esc(c['coin'])}: score {c['total']:.0f} - " + esc((c["reasons"] or ["weak setup"])[0]))
+        L.append("")
+    if danger:
+        L.append(B("⚠️ Overheated - pullback risk (not shorts, just caution)"))
+        for dgr in danger:
+            L.append(f"• {esc(dgr['coin'])} {dgr['chg']:+.0f}% 24h: " + esc("; ".join(dgr["reasons"])))
+        L.append("")
+    L.append("<i>/scanstats shows how past picks actually performed. Use small size and a stop - thin coins can be manipulated.</i>")
+    return "\n".join(L)[:3900]
+
+
+def cmd_scan(state):
+    send("🎯 Scanning ~50 liquid coins (technical + news + positioning)... about a minute.", level="low")
+    out = run_scan(state, manual=True)
+    if out is None:
+        send("Couldn't load coin data right now. Try again in a minute (see /health).")
+        return
+    picks, finalists, danger = out
+    tg_send_html(scan_full_html(picks, finalists, danger), tab_keyboard("summary") if not picks else
+                 {"inline_keyboard": [[{"text": f"📊 {p['coin']} chart", "callback_data": f"an:{p['coin']}:1h"}
+                                       for p in picks[:3]]]}, level="normal")
+
+
+def log_picks(state, picks):
+    log = state.setdefault("scan_log", [])
+    now = time.time()
+    btc = (TICKERS["data"].get("BTC") or {}).get("price")
+    for p in picks:
+        if any(x["coin"] == p["coin"] and now - x["ts"] < 6 * 3600 for x in log):
+            continue
+        log.append({"id": f"{p['coin']}-{int(now)}", "coin": p["coin"], "ts": now, "price": p["price"],
+                    "score": round(p["total"], 1), "tech": round(p["tech"], 1), "trigger": p["trigger"],
+                    "invalid": p["invalid"], "btc_price": btc, "max_up": 0.0, "max_dn": 0.0,
+                    "first": None, "res": {}, "status": "open"})
+
+
+def update_scan_outcomes(state):
+    """Paper-trade every pick: +5% target vs -3% stop within 24h, plus 1h/4h/24h returns vs BTC."""
+    tk, now = TICKERS["data"], time.time()
+    btc_now = (tk.get("BTC") or {}).get("price")
+    for p in state.get("scan_log") or []:
+        if p["status"] != "open":
+            continue
+        px = (tk.get(p["coin"]) or {}).get("price")
+        if not px:
+            continue
+        age = now - p["ts"]
+        ret = (px - p["price"]) / p["price"] * 100
+        p["max_up"], p["max_dn"] = max(p["max_up"], ret), min(p["max_dn"], ret)
+        if p["first"] is None:
+            if ret >= 5:
+                p["first"] = "target"
+            elif ret <= -3:
+                p["first"] = "stop"
+        btc_ret = pct_change(btc_now, p["btc_price"]) if btc_now and p.get("btc_price") else None
+        for name, secs in (("1h", 3600), ("4h", 14400), ("24h", 86400)):
+            if age >= secs and name not in p["res"]:
+                p["res"][name] = {"ret": ret, "btc": btc_ret}
+        if age >= 86400:
+            p["status"] = "done"
+            p["first"] = p["first"] or "timeout"
+            p["final"] = ret
+
+
+def scan_stats_text(state):
+    log = state.get("scan_log") or []
+    done = [p for p in log if p["status"] == "done"]
+    opened = [p for p in log if p["status"] == "open"]
+    L = [B("🏁 BREAKOUT SCOREBOARD (paper trading)"),
+         "<i>Every pick is simulated: entry at the pick price, +5% target, -3% stop, 24h limit. "
+         "Prices are sampled every ~2 min, so very fast spikes can be missed.</i>", ""]
+    L.append(f"Picks logged: {len(log)} | finished: {len(done)} | still open: {len(opened)}")
+    if done:
+        n = len(done)
+        tgt = sum(1 for p in done if p["first"] == "target")
+        stp = sum(1 for p in done if p["first"] == "stop")
+        r = sum(1.67 if p["first"] == "target" else -1.0 if p["first"] == "stop" else p.get("final", 0) / 3 for p in done)
+        L += ["", f"Hit +5% before -3%: {tgt}/{n} ({tgt / n * 100:.0f}%) | stopped first: {stp}/{n} ({stp / n * 100:.0f}%) "
+                  f"| neither: {n - tgt - stp}",
+              f"Paper result: {r:+.1f}R total ({r / n:+.2f}R per pick, 1R = 3%)"]
+        for name in ("1h", "4h", "24h"):
+            rs = [p["res"][name] for p in done if name in p["res"]]
+            if rs:
+                avg = sum(x["ret"] for x in rs) / len(rs)
+                vs = [x["ret"] - x["btc"] for x in rs if x.get("btc") is not None]
+                L.append(f"Average return after {name}: {avg:+.1f}%" + (f" ({sum(vs) / len(vs):+.1f} vs BTC)" if vs else ""))
+    if opened:
+        L += ["", B("Open picks")]
+        for p in opened[-5:]:
+            px = (TICKERS["data"].get(p["coin"]) or {}).get("price")
+            ret = (px - p["price"]) / p["price"] * 100 if px else None
+            L.append(f"• {esc(p['coin'])} from {esc(fmt_price(p['price']))}: {_pct(ret)} (best {p['max_up']:+.1f}%, worst {p['max_dn']:+.1f}%)")
+    L += ["", f"⚠️ <i>{'Only ' + str(len(done)) + ' finished picks - far too few to judge. ' if len(done) < 100 else ''}"
+              "Trust this only after 100+ finished picks, and compare against simply buying random liquid coins.</i>"]
+    return "\n".join(L)
+
+
+def notify(state, html_full, markup=None, level="normal", digest_line=None):
+    """Send now, or queue one line for the digest when digest mode is on (critical never queued)."""
+    dg = state.get("digest") or {}
+    if dg.get("on") and level != "critical" and digest_line:
+        dg.setdefault("queue", []).append(digest_line)
+        dg["queue"] = dg["queue"][-40:]
+        state["digest"] = dg
+        return None
+    return tg_send_html(html_full, markup, level=level)
+
+
+def flush_digest(state):
+    dg = state.get("digest") or {}
+    if not dg.get("on") or not dg.get("queue"):
+        return
+    if time.time() - dg.get("last", 0) < dg.get("hours", 3) * 3600:
+        return
+    lines, dg["queue"], dg["last"] = dg["queue"], [], time.time()
+    tg_send_html(B(f"🗞 DIGEST - {len(lines)} alerts") + "\n\n" + "\n".join(lines)[:3800],
+                 tab_keyboard("summary"), level="low")
+
+
+def cmd_digest(state, args):
+    dg = state.setdefault("digest", {"on": False, "hours": 3, "last": 0, "queue": []})
+    a = [x.lower() for x in args]
+    if a and a[0] == "off":
+        dg["on"] = False
+        send("✅ Digest off - alerts arrive one by one.")
+    elif a and a[0] == "now":
+        dg["last"] = 0
+        flush_digest(state)
+        if not dg.get("queue"):
+            send("Nothing queued right now.")
+    elif a and a[0] == "on":
+        hrs = safe_float(a[1]) if len(a) > 1 else 3
+        dg.update(on=True, hours=int(clamp(hrs or 3, 1, 24)), last=time.time())
+        send(f"✅ Digest on: pump/dump, level, listing and scanner alerts are bundled into one message every "
+             f"{dg['hours']}h. Trade and critical alerts still arrive instantly.")
+    else:
+        send(f"Digest: {'on every ' + str(dg.get('hours', 3)) + 'h' if dg.get('on') else 'off'} "
+             f"({len(dg.get('queue') or [])} queued).\n/digest on 3 | /digest off | /digest now")
+
+
+def _levels_for(base):
+    c = LEVEL_CACHE.get(base)
+    if c and time.time() - c[0] < 900:
+        return c[1], c[2]
+    df = get_klines("1h", 120, base + "USDT")
+    if len(df) < 60:
+        return None, None
+    closed = df.iloc[:-1]
+    res, sup = float(closed["high"].tail(50).max()), float(closed["low"].tail(50).min())
+    LEVEL_CACHE[base] = (time.time(), res, sup)
+    return res, sup
+
+
+def check_near_levels(state):
+    """'Approaching resistance/support' heads-up for BTC and watchlist coins (within 0.5%)."""
+    coins = ["BTC"] + [c for c in (state.get("watchlist") or []) if c != "BTC"]
+    cd, now = state.setdefault("pump_cooldown", {}), time.time()
+    for b in coins[:8]:
+        px = _price_of(b)
+        res, sup = _levels_for(b)
+        if not px:
+            continue
+        for kind, lvl in (("resistance", res), ("support", sup)):
+            if not lvl:
+                continue
+            dist = (lvl - px) / px * 100 if kind == "resistance" else (px - lvl) / px * 100
+            key = f"near:{b}:{kind}:{round(lvl, 6)}"
+            if 0 <= dist <= 0.5 and now - cd.get(key, 0) > 4 * 3600:
+                txt = (B(f"🎯 {b} approaching {kind}") + f"\nPrice {esc(fmt_price(px))} is {dist:.2f}% from the 50-hour "
+                       f"{'high' if kind == 'resistance' else 'low'} {esc(fmt_price(lvl))}.\n"
+                       "<i>Watch for a candle CLOSE beyond it - wicks often reverse.</i>")
+                notify(state, txt, coin_buttons(b), level="normal",
+                       digest_line=f"🎯 {b} near {kind} {esc(fmt_price(lvl))}")
+                cd[key] = now
+
+
+def check_listings(state):
+    """New exchange-listing announcements (Binance announcement feed + news search). Not instant."""
+    seen = set(state.get("listing_seen") or [])
+    first = not seen
+    found = []
+    d = http_json("https://www.binance.com/bapi/composite/v1/public/cms/article/list/query",
+                  {"type": 1, "catalogId": 48, "pageNo": 1, "pageSize": 10})
+    try:
+        for cat in d["data"]["catalogs"]:
+            for a in cat["articles"]:
+                found.append(("Binance", clean_text(a["title"]),
+                              "https://www.binance.com/en/support/announcement/" + str(a.get("code", ""))))
+    except Exception:
+        pass
+    for q in ('Binance "will list"', 'Coinbase listing "adds support"', "Upbit new listing KRW market"):
+        url = f"https://news.google.com/rss/search?q={quote(q + ' when:1d')}&hl=en-US&gl=US&ceid=US%3Aen"
+        for it in parse_rss(url, "Listing")[:8]:
+            m = EXCH_RX.search(it["title"])
+            if m and LIST_RX.search(it["title"]):
+                found.append((m.group(1).title(), it["title"], it["link"]))
+    sent = 0
+    for exch, title, link in found:
+        key = hashlib.sha1(title.lower().encode("utf-8", errors="ignore")).hexdigest()
+        if key in seen:
+            continue
+        seen.add(key)
+        state.setdefault("listing_seen", []).append(key)
+        if first or sent >= 3:
+            continue
+        m = re.search(r"\(([A-Z0-9]{2,10})\)", title)
+        coin = m.group(1) if m else None
+        row = (TICKERS["data"].get(coin) or {}) if coin else {}
+        L = [B(f"🆕 LISTING NEWS ({exch})"), esc(title[:200])]
+        if row.get("price"):
+            L.append(f"{esc(coin)} now {esc(fmt_price(row['price']))} ({_pct(row.get('change_24h'))} 24h)")
+        L += ["", "<i>News-based, so it can lag the real announcement. Listings often spike then fade - "
+                  "don't chase, check the spread and volume first.</i>"]
+        notify(state, "\n".join(L), coin_buttons(coin) if coin else None, level="normal",
+               digest_line=f"🆕 {exch} listing: {esc(title[:90])}")
+        sent += 1
+
+
+_ANALYZE_RX = re.compile(r"\b(analy[sz]e|analysis|chart|technical|support|resistance)\b", re.I)
+
+
+_SCAN_RX = re.compile(r"((which|what|any|best|top).{0,25}(coin|coins|crypto|token|tokens|altcoin|altcoins).{0,40}"
+                      r"(pump|boost|breakout|break out|moon|explode|blow|run|buy|watch))|"
+                      r"going to (pump|boost|blow|moon|explode)|breakout (scan|watch|coin|coins)|"
+                      r"\b(blow up|about to pump|next pump|next big mover)\b", re.I)
+
+
+_SCORE_RX = re.compile(r"(scoreboard|how accurate|scan stats|paper trad|how did (your|the) picks)", re.I)
 
 
 # ============================================================
@@ -4371,21 +5428,27 @@ def send_document(path, caption=""):
 HELP_TEXT = (
     "🤖 WHAT I CAN DO\n\n"
     "ASK ME (just type):\n"
-    "• why did SOL pump today?\n• weekend outlook\n• top movers\n• how is DOGE doing?\n\n"
+    "• which coin may break out?\n• analyze SOL on 15m\n• why did DOGE pump today?\n"
+    "• weekend outlook\n• top movers\n\n"
+    "SCANNER & CHARTS\n"
+    "/scan - coins where technicals + news line up (best one is pinned with a chart)\n"
+    "/analyze SOL 15m - full chart analysis, any coin, 5m 15m 30m 1h 4h 1d 1w\n"
+    "/scanstats - scoreboard: how past picks really performed (paper trading)\n\n"
     "MARKET\n"
     "/report - market card (tabs inside)\n/why SOL - why a coin pumped or dumped\n"
-    "/coin SOL - quick analysis of any coin\n/movers - top gainers and losers\n"
-    "/weekend - weekend / market-closed outlook\n/plan - today's plan\n/glossary - plain-English terms\n\n"
+    "/coin SOL - quick analysis\n/movers - top gainers and losers\n"
+    "/weekend - market-closed outlook\n/plan - today's plan\n/glossary - plain-English terms\n\n"
     "TRADES\n"
-    "/trade - live trade\n/stats - track record (+ your own calls)\n/chart - chart with levels\n"
+    "/trade - live trade\n/stats - track record (+ your own calls)\n/chart - BTC chart\n"
     "/account 500 - account size in USD\n/risk 1 - risk per trade % (0.1-3)\n"
     "/pause /resume - stop / allow new signals\n\n"
     "ALERTS\n"
     "/alert 70000 - price alert (also /alert SOL 200, /alert close 1h above 68000)\n"
     "/alert list | /alert del 3 | /alert clear\n"
-    "/watch SOL ETH - watchlist (earlier pump/dump alerts) | /unwatch SOL\n\n"
+    "/watch SOL ETH - watchlist | /unwatch SOL\n"
+    "/digest on 3 - bundle routine alerts into one message every 3h\n\n"
     "SETTINGS\n"
-    "/tz Asia/Karachi - your timezone\n/quiet 00:00-07:00 - silent hours\n"
+    "/tz Asia/Karachi - timezone\n/quiet 00:00-07:00 - silent hours\n"
     "/mode important - only trade alerts make sound\n/lang en|simple|ur - language\n\n"
     "SYSTEM\n"
     "/status /health /export /weekly /start (setup)"
@@ -4479,6 +5542,14 @@ def handle_command(state, cmd, args):
         send(weekly_report_text(state))
     elif cmd == "/watch":
         cmd_watch(state, args)
+    elif cmd in ("/analyze", "/ta"):
+        cmd_analyze(state, args)
+    elif cmd == "/scan":
+        cmd_scan(state)
+    elif cmd in ("/scanstats", "/paper"):
+        tg_send_html(scan_stats_text(state), None, level="normal")
+    elif cmd == "/digest":
+        cmd_digest(state, args)
     elif cmd == "/unwatch":
         cmd_watch(state, args, remove=True)
     elif cmd == "/alert":
@@ -4501,6 +5572,8 @@ def handle_command(state, cmd, args):
             send("No active trade right now.")
     elif cmd == "/stats":
         tg_send_html(build_tab("stats", state), tab_keyboard("stats"), level="normal")
+    elif cmd == "/chart" and args:
+        cmd_analyze(state, args)
     elif cmd == "/chart":
         png = make_chart()
         if png:
@@ -4547,6 +5620,10 @@ def handle_update(state, u):
             cmd_why(state, [data[4:]])
         elif data.startswith("coin:"):
             cmd_coin(state, [data[5:]])
+        elif data.startswith("an:"):
+            cmd_analyze(state, data.split(":")[1:3])
+        elif data == "scan":
+            cmd_scan(state)
         elif data == "movers":
             cmd_movers(state)
         elif data == "details":
@@ -4774,7 +5851,7 @@ def send_startup(restart=False):
         send("🔄 Bot restarted after an error and is running again. Open trades are restored.")
         return
     send(
-        "₿ BTC MARKET BOT v3.3 STARTED\n"
+        "₿ BTC MARKET BOT v3.4 STARTED\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "• A clear action every 30 min: LONG / SHORT / WAIT\n"
         "• Headline card + tabs: Trend, Futures, Macro, News, Levels, Stats\n"
@@ -4797,6 +5874,8 @@ def run_bot(state, deadline, restart=False):
     register_commands()
 
     t_fast = t_slow = t_cal = t_tick = 0
+    t_scan = time.time() - SCAN_INTERVAL + 90   # first scan ~90s after start
+    t_list = 0
     tech, futures, cross, news, events, ticker = {}, {}, {}, [], [], {}
     fng, crowd, glob, opts = None, {}, None, None
     errors = 0
@@ -4837,9 +5916,24 @@ def run_bot(state, deadline, restart=False):
                     refresh_tickers()
                     update_tick_hist(state)
                     check_pump_dump(state)
+                    update_scan_outcomes(state)
+                    check_near_levels(state)
+                    flush_digest(state)
                 except Exception:
                     traceback.print_exc()
                 t_tick = now
+            if SCAN_ENABLED and now - t_scan >= SCAN_INTERVAL and TICKERS["data"]:
+                try:
+                    run_scan(state)
+                except Exception:
+                    traceback.print_exc()
+                t_scan = now
+            if now - t_list >= 600:
+                try:
+                    check_listings(state)
+                except Exception:
+                    traceback.print_exc()
+                t_list = now
             update_event_reactions(state, events)
             check_event_alerts(state, events)
             check_actual_event_changes(state, events)
