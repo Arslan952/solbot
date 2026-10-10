@@ -56,6 +56,10 @@ jobs:
           LIQ_WS: "1"
           MAX_LEVERAGE: "3"
           SIGNAL_CONFIRM: "3"
+          WEEKEND_MODE: "1"
+          DAILY_LOSS_LIMIT: "3"
+          MAX_TRADES_PER_DAY: "4"
+          PUMP_1H_PCT: "6"
         run: |
           python bot.py
 
