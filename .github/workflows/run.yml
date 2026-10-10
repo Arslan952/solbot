@@ -60,6 +60,8 @@ jobs:
           DAILY_LOSS_LIMIT: "3"
           MAX_TRADES_PER_DAY: "4"
           PUMP_1H_PCT: "6"
+          SCAN_ENABLED: "1"
+          SCAN_MIN_SCORE: "60"
         run: |
           python bot.py
 
