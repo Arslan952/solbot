@@ -1,8 +1,20 @@
-# BTC Market Intelligence Bot (v3.4)
+# BTC Market Intelligence Bot (v3.5)
 
 A Telegram bot that watches Bitcoin and the wider crypto market, explains what is happening in plain
 English, finds coins with technical + news setups, and sends LONG / SHORT / WAIT setups with a public track record.
 **It never places orders. Information only. Nobody can reliably predict pumps - it shows evidence and keeps score.**
+
+## New in v3.5 - Morning Brief
+Every morning at your local time (default 07:30, set your timezone with `/tz`) the bot posts and **pins** one message:
+- **🟢 Potential to go up** - top 5 coins where technical and news/positioning conditions line up, with why, a confirm
+  level and an invalid level.
+- **🔴 At risk of dumping** - top 5 coins with breakdown setups (support breaking, heavy selling volume, weak vs BTC,
+  falling EMAs, crowded longs, negative news such as unlocks/hacks/delistings), plus an **overheated after a big pump**
+  list. Coins that are already deeply oversold are labelled "bounce risk" instead of "high risk".
+- BTC mood, today's big events, and **how yesterday's two lists actually did 24h later** (the running record is in `/scanstats`).
+- Commands: `/brief` (now), `/dump` (dump-risk list now), `/morning 07:30`, `/morning off`. Or just ask:
+  "morning brief", "which coins will dump?", "which coins will pump or dump today?".
+- It is a watch-list of conditions, not a prediction: confirm with a candle close, use a stop, keep size small on small coins.
 
 ## New in v3.4
 - **Chart analysis for any coin and timeframe:** `/analyze SOL 15m` (5m 15m 30m 1h 4h 1d 1w) or just type
