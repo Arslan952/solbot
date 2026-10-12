@@ -323,6 +323,7 @@ def test_daily_plan_posted_once_and_pinned():
     real = bot.now_utc
     bot.now_utc = lambda: datetime(2026, 10, 9, 9, 0, tzinfo=timezone.utc)
     try:
+        st["morning"]["on"] = False                       # with the brief on, the brief is the pinned one
         bot.check_daily_plan(st)
         bot.check_daily_plan(st)
         assert s.texts.count("DAILY PLAN") == 1 and len(s.pins) == 1
