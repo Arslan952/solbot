@@ -23,7 +23,7 @@ import requests
 
 
 # ============================================================
-# BTC MARKET INTELLIGENCE TELEGRAM BOT  (v3.4)
+# BTC MARKET INTELLIGENCE TELEGRAM BOT  (v3.5)
 # ------------------------------------------------------------
 #  1. Signal tracking: every LONG/SHORT is logged and followed
 #     until it hits stop / TP1 / TP2; win-rate + R stats
@@ -143,7 +143,7 @@ BEAR_TRENDS = ("BEARISH", "WEAK BEARISH")
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "BTC-Market-Intelligence-Bot/3.4",
+    "User-Agent": "BTC-Market-Intelligence-Bot/3.5",
     "Accept": "*/*",
 })
 
@@ -397,6 +397,8 @@ def default_state():
         "scan_log": [],
         "listing_seen": [],
         "digest": {"on": False, "hours": 3, "last": 0, "queue": []},
+        "morning": {"on": True, "time": "07:30", "last": "", "msg": None},
+        "morning_log": [],
     }
 
 
@@ -2336,7 +2338,8 @@ MAJOR_PUMP_PCT = {"BTC": 2.0, "ETH": 3.0, "BNB": 3.0, "XRP": 4.0}
 
 
 BOT_COMMANDS = [
-    ("report", "Market card now"), ("scan", "Coins that may break out (technical + news)"),
+    ("brief", "Morning brief: coins to go up / dump"), ("dump", "Coins at risk of dumping"),
+    ("morning", "Morning brief time /morning 07:30"), ("report", "Market card now"), ("scan", "Coins that may break out (technical + news)"),
     ("analyze", "Chart analysis /analyze SOL 15m"), ("why", "Why did a coin pump/dump? /why SOL"),
     ("coin", "Quick analysis of any coin /coin SOL"), ("movers", "Top gainers and losers"),
     ("weekend", "Weekend / market-closed outlook"), ("plan", "Today's plan"),
@@ -2480,6 +2483,7 @@ def _trim_state(state):
                               if time.time() - v < 6 * 3600}
     state["scan_log"] = (state.get("scan_log") or [])[-400:]
     state["listing_seen"] = (state.get("listing_seen") or [])[-300:]
+    state["morning_log"] = (state.get("morning_log") or [])[-60:]
     dg = state.get("digest")
     if isinstance(dg, dict):
         dg["queue"] = (dg.get("queue") or [])[-40:]
@@ -3345,7 +3349,8 @@ def check_daily_plan(state):
         if mid:
             if state.get("plan_msg"):
                 unpin_message(state["plan_msg"])
-            pin_message(mid)
+            if not (state.get("morning") or {}).get("on", True):
+                pin_message(mid)
             state["plan_msg"] = mid
         state["last_plan_date"] = today
 
@@ -3623,6 +3628,14 @@ def handle_text(state, text):
     low = t.lower()
     if not t:
         return
+    if _BRIEF_RX.search(low) or (re.search(r"\bpump", low) and re.search(r"\bdump", low)
+                                 and re.search(r"\b(coin|coins|crypto|today|morning)\b", low)):
+        send("☀️ Building the brief (scanning coins up and down, about 1-2 minutes)...", level="low")
+        send_morning_brief(state, manual=True)
+        return
+    if _DUMP_RX.search(low):
+        cmd_dump(state)
+        return
     if _SCORE_RX.search(low):
         tg_send_html(scan_stats_text(state), None, level="normal")
         return
@@ -3687,7 +3700,7 @@ def cmd_quiet(state, args):
 
 
 # ============================================================
-# v3.4 FEATURES: chart analysis, breakout scanner, scoreboard, listings, digest
+# v3.4-3.5 FEATURES: chart analysis, scanner, morning brief, scoreboard, listings, digest
 # ============================================================
 
 TA_TFS = ["5m", "15m", "30m", "1h", "4h", "1d", "1w"]
@@ -3891,6 +3904,8 @@ def analyze_df(df, tf="1h"):
     bull_inv = (sup[0][0] - 0.2 * atr) if sup else price - 1.5 * atr
     bear_trig = sup[0][0] if sup else rl
     bear_inv = (res[0][0] + 0.2 * atr) if res else price + 1.5 * atr
+    bull_inv = min(bull_inv, bull_trig - 0.3 * atr)                      # invalidation must sit beyond the trigger
+    bear_inv = max(bear_inv, bear_trig + 0.3 * atr)
     bull_active, bear_active = price > bull_trig, price < bear_trig      # move already under way
     bref, sref = max(bull_trig, price), min(bear_trig, price)           # measure targets from here
     bull_t = [res[1][0] if len(res) > 1 and res[1][0] > bref else bref + 1.5 * atr, bref + 3 * atr]
@@ -4318,7 +4333,7 @@ def scan_danger(tk, limit=3):
     rows.sort(key=lambda kv: -kv[1]["change_24h"])
     out = []
     for b, v in rows[:8]:
-        df = add_indicators(get_klines("1h", 120, b + "USDT"))
+        df = add_indicators(cached_klines("1h", 120, b + "USDT"))
         time.sleep(0.1)
         if len(df) < 60:
             continue
@@ -4358,7 +4373,7 @@ def run_scan(state, manual=False):
     btc_chg = (tk.get("BTC") or {}).get("change_24h")
     cands = []
     for b, v in scan_universe(tk, SCAN_MAX_COINS):
-        df = add_indicators(get_klines("1h", 200, b + "USDT"))
+        df = add_indicators(cached_klines("1h", 200, b + "USDT"))
         time.sleep(0.1)
         sc = score_breakout(df, None, v, btc_chg)
         if sc and sc["tech"] >= 35:
@@ -4369,7 +4384,7 @@ def run_scan(state, manual=False):
     cands.sort(key=lambda x: -x["tech"])
     finalists = cands[:6]
     for c in finalists:
-        df4 = add_indicators(get_klines("4h", 150, c["coin"] + "USDT"))
+        df4 = add_indicators(cached_klines("4h", 150, c["coin"] + "USDT"))
         sc2 = score_breakout(c["df"], df4, c["tk"], btc_chg)
         if sc2:
             c.update(tech=sc2["tech"], reasons=sc2["reasons"], flags=sc2["flags"], an=sc2["an"],
@@ -4576,6 +4591,7 @@ def scan_stats_text(state):
             px = (TICKERS["data"].get(p["coin"]) or {}).get("price")
             ret = (px - p["price"]) / p["price"] * 100 if px else None
             L.append(f"• {esc(p['coin'])} from {esc(fmt_price(p['price']))}: {_pct(ret)} (best {p['max_up']:+.1f}%, worst {p['max_dn']:+.1f}%)")
+    L += morning_stats_lines(state)
     L += ["", f"⚠️ <i>{'Only ' + str(len(done)) + ' finished picks - far too few to judge. ' if len(done) < 100 else ''}"
               "Trust this only after 100+ finished picks, and compare against simply buying random liquid coins.</i>"]
     return "\n".join(L)
@@ -4702,6 +4718,429 @@ def check_listings(state):
         sent += 1
 
 
+DUMP_MIN_SCORE = float(os.environ.get("DUMP_MIN_SCORE", "55"))
+
+
+KLINE_CACHE = {}
+
+
+def cached_klines(interval, limit, symbol, ttl=600):
+    """Kline downloads shared between the upside scan, downside scan and brief (10 min cache)."""
+    key = (id(get_klines), symbol, interval, limit)
+    c = KLINE_CACHE.get(key)
+    if c and time.time() - c[0] < ttl:
+        return c[1]
+    df = get_klines(interval, limit, symbol)
+    KLINE_CACHE[key] = (time.time(), df)
+    if len(KLINE_CACHE) > 400:
+        for k in sorted(KLINE_CACHE, key=lambda k: KLINE_CACHE[k][0])[:100]:
+            del KLINE_CACHE[k]
+    return df
+
+
+def score_breakdown(df, df4=None, tk_row=None, btc_chg=None):
+    """Technical 'breakdown risk' score (0-100) from the 1h chart (+4h context)."""
+    if df is None or len(df) < 120:
+        return None
+    if "rsi" not in df.columns:
+        df = add_indicators(df)
+    an = analyze_df(df, "1h")
+    if not an:
+        return None
+    closed = df.iloc[:-1]
+    price, atr, s = an["price"], an["atr"], an["snap"]
+    pts, reasons, flags = 0.0, [], []
+    ch24 = (tk_row or {}).get("change_24h")
+
+    if an["release"] == "down":
+        pts += 20
+        reasons.append("1h volatility squeeze just released downward")
+    elif an["squeeze"]:
+        pts += 4
+        reasons.append("coiling in a tight squeeze (direction not decided yet)")
+    sup = an["supports"]
+    if an["breakout"] and an["breakout"][0] == "down":
+        pts += 15
+        reasons.append(f"closed below its 20-bar range ({fmt_price(an['breakout'][1])})"
+                       + (" on strong volume" if an["breakout"][2] >= 1.3 else " (volume still light)"))
+    elif sup and 0 < (price - sup[0][0]) / price <= 0.015:
+        pts += 15
+        reasons.append(f"sitting on support {fmt_price(sup[0][0])} ({(price - sup[0][0]) / price * 100:.1f}% above) - "
+                       "a break would accelerate the fall")
+
+    base_vol = float(closed["volume"].tail(23).head(20).mean())
+    vol3 = float(closed["volume"].tail(3).mean()) / base_vol if base_vol > 0 else 1.0
+    last3 = closed.tail(3)
+    reds = int((last3["close"] < last3["open"]).sum())
+    if vol3 >= 2.5 and reds >= 2:
+        pts += 15
+        reasons.append(f"heavy selling volume ({vol3:.1f}x normal over the last 3 hours)")
+    elif vol3 >= 1.5 and reds >= 2:
+        pts += 10
+        reasons.append(f"selling volume rising ({vol3:.1f}x normal)")
+
+    if ch24 is not None and btc_chg is not None:
+        rs = ch24 - btc_chg
+        if rs <= -3:
+            pts += 10
+            reasons.append(f"weaker than BTC today ({rs:+.1f} points)")
+        elif rs <= -1.5:
+            pts += 5
+            reasons.append(f"slightly weaker than BTC ({rs:+.1f} points)")
+
+    last = closed.iloc[-1]
+    if last["close"] < last["ema21"] < last["ema50"]:
+        pts += 10
+        reasons.append("price below falling 21/50 EMAs")
+    if last["ema50"] < last["ema200"]:
+        pts += 5
+    if an["structure"] and an["structure"].startswith("lower"):
+        pts += 5
+        reasons.append("lower highs - sellers capping every bounce")
+    adx_now, adx_prev = float(closed["adx"].iloc[-1]), float(closed["adx"].iloc[-6])
+    if 15 <= adx_now <= 28 and adx_now > adx_prev and s["trend"] in ("BEARISH", "WEAK BEARISH"):
+        pts += 8
+        reasons.append(f"downtrend strength waking up (ADX {adx_prev:.0f} → {adx_now:.0f})")
+    rsi = s["rsi"]
+    if rsi is not None:
+        if 30 <= rsi <= 45:
+            pts += 8
+            reasons.append(f"momentum weak (RSI {rsi:.0f}) with room to fall")
+        elif rsi < 25:
+            pts -= 25
+            flags.append(f"RSI {rsi:.0f} - oversold, a bounce is likely")
+        elif rsi < 30:
+            flags.append(f"RSI {rsi:.0f} - near oversold")
+    if df4 is not None and len(df4) >= 60:
+        t4 = snapshot(df4.iloc[-2])["trend"]
+        if t4 in ("BEARISH", "WEAK BEARISH"):
+            pts += 8
+            reasons.append("4h trend is down")
+        elif t4 in ("BULLISH", "WEAK BULLISH"):
+            pts -= 10
+            flags.append("4h trend is up - the dip may be bought")
+    if ch24 is not None and ch24 < -15:
+        pts -= 15
+        flags.append(f"already down {abs(ch24):.0f}% today - may be late")
+    if an["div"] == "bullish":
+        pts -= 10
+        flags.append("bullish RSI divergence")
+
+    return {"tech": clamp(pts, 0, 100), "reasons": reasons, "flags": flags, "price": price,
+            "trigger": an["bear"]["trigger"], "invalid": an["bear"]["invalid"], "targets": an["bear"]["targets"],
+            "an": an}
+
+
+def enrich_downside(c):
+    """Positioning (funding / open interest) and negative-news points for a downside candidate."""
+    base = c["coin"]
+    d = coin_derivs(base)
+    items = coin_news(base)
+    dpts, news, flags = 0.0, [], []
+    f = d.get("funding")
+    if f is not None and f > 0.0005:
+        dpts += 10
+        news.append(f"crowded longs (funding {f * 100:+.3f}%) - fuel for a drop")
+    elif f is not None and f < -0.0005:
+        dpts -= 8
+        flags.append(f"shorts are crowded (funding {f * 100:+.3f}%) - squeeze/bounce risk")
+    oi = d.get("oi_change_6h") if d.get("oi_change_6h") is not None else d.get("oi_change_24h")
+    if oi is not None and oi >= 4 and (c.get("chg_6h") or 0) < -1:
+        dpts += 10
+        news.append(f"new shorts piling in: open interest {oi:+.0f}% while price falls")
+    elif oi is not None and oi <= -5 and (c.get("chg_6h") or 0) < -2:
+        flags.append("longs are already being flushed (open interest falling) - part of the drop may be done")
+    text = " ".join(i["title"] for i in items)
+    npts = 0.0
+    for name, rx in _CAT_RX.items():
+        if not rx.search(text):
+            continue
+        if name in NEG_TAGS:
+            npts += abs(NEG_TAGS[name])
+            news.append(f"negative headline: {name}")
+        elif name in POS_TAGS:
+            npts -= 5
+            flags.append(f"positive headline ({name}) could trigger a bounce")
+    c.update(deriv_pts=dpts, news_pts=clamp(npts, -10, 30), news=news, flags=c["flags"] + flags,
+             headlines=[i["title"][:100] for i in items[:2]], funding=f, no_news=not items)
+
+
+def run_downside_scan(state):
+    tk = tickers(max_age=60)
+    if not tk:
+        return []
+    btc_chg = (tk.get("BTC") or {}).get("change_24h")
+    rows = [(b, v) for b, v in tk.items()
+            if b not in EXCLUDE and (v.get("quote_vol") or 0) >= SCAN_MIN_VOL and v.get("price")
+            and v.get("change_24h") is not None and -25 <= v["change_24h"] <= 8]
+    rows.sort(key=lambda kv: -kv[1]["quote_vol"])
+    cands = []
+    for b, v in rows[:SCAN_MAX_COINS]:
+        df = add_indicators(cached_klines("1h", 200, b + "USDT"))
+        time.sleep(0.05)
+        sc = score_breakdown(df, None, v, btc_chg)
+        if sc and sc["tech"] >= 30:
+            c = df["close"]
+            sc.update(coin=b, tk=v, df=df, chg_24h=v.get("change_24h"),
+                      chg_6h=pct_change(sc["price"], float(c.iloc[-7])) if len(c) > 8 else 0)
+            cands.append(sc)
+    cands.sort(key=lambda x: -x["tech"])
+    fin = cands[:6]
+    for c in fin:
+        df4 = add_indicators(cached_klines("4h", 150, c["coin"] + "USDT"))
+        sc2 = score_breakdown(c["df"], df4, c["tk"], btc_chg)
+        if sc2:
+            c.update(tech=sc2["tech"], reasons=sc2["reasons"], flags=sc2["flags"], an=sc2["an"],
+                     trigger=sc2["trigger"], invalid=sc2["invalid"], targets=sc2["targets"])
+        enrich_downside(c)
+        c["total"] = clamp(c["tech"] + c["deriv_pts"] + c["news_pts"], 0, 100)
+    SCAN_CACHE["down"] = (time.time(), fin)
+    return sorted(fin, key=lambda x: -x["total"])
+
+
+def _up_block(i, c, detailed):
+    strong = c["total"] >= SCAN_MIN_SCORE
+    tag = "★ strong setup" if strong else "watch"
+    if not detailed:
+        return [f"• <b>{esc(c['coin'])}</b> {quality_stars(c['total'])} {c['total']:.0f} ({tag}) - "
+                + esc((c["reasons"] or ["building"])[0])]
+    L = [B(f"{i}. {c['coin']}  {quality_stars(c['total'])}  score {c['total']:.0f}  ({tag})"),
+         f"Price {esc(fmt_price(c['price']))} | 24h {_pct(c.get('chg_24h'))}"]
+    L += ["• " + esc(r) for r in c["reasons"][:2]]
+    L += ["• " + esc(r) for r in c.get("news", [])[:1]]
+    if c.get("headlines"):
+        L.append("📰 " + esc(c["headlines"][0]))
+    L.append((f"✅ Holding above {esc(fmt_price(c['trigger']))}" if c["price"] > c["trigger"]
+              else f"✅ Confirm: 1h close above {esc(fmt_price(c['trigger']))}")
+             + f" | ❌ invalid below {esc(fmt_price(c['invalid']))}")
+    if c["flags"]:
+        L.append("⚠️ " + esc("; ".join(c["flags"][:2])))
+    return L
+
+
+def _down_block(i, c, detailed):
+    bounce = any("oversold" in f for f in c.get("flags", []))
+    strong = c["total"] >= DUMP_MIN_SCORE and not bounce
+    tag = "high risk" if strong else "watch - oversold, bounce risk" if bounce else "watch"
+    if not detailed:
+        return [f"• <b>{esc(c['coin'])}</b> {c['total']:.0f} ({tag}) - " + esc((c["reasons"] or ["weak"])[0])]
+    L = [B(f"{i}. {c['coin']}  risk {c['total']:.0f}/100  ({tag})"),
+         f"Price {esc(fmt_price(c['price']))} | 24h {_pct(c.get('chg_24h'))}"]
+    L += ["• " + esc(r) for r in c["reasons"][:2]]
+    L += ["• " + esc(r) for r in c.get("news", [])[:1]]
+    if c.get("headlines") and any("negative headline" in n for n in c.get("news", [])):
+        L.append("📰 " + esc(c["headlines"][0]))
+    L.append((f"⚠️ Already below {esc(fmt_price(c['trigger']))} - sellers in control" if c["price"] < c["trigger"]
+              else f"⚠️ A 1h close below {esc(fmt_price(c['trigger']))} would confirm")
+             + f" | wrong if it closes above {esc(fmt_price(c['invalid']))}")
+    if c["flags"]:
+        L.append("ℹ️ " + esc("; ".join(c["flags"][:2])))
+    return L
+
+
+def morning_stats_lines(state):
+    done = [m for m in (state.get("morning_log") or []) if m.get("res")]
+    if not done:
+        return []
+    ups = [m["res"]["up_avg"] for m in done if m["res"].get("up_avg") is not None]
+    dns = [m["res"]["down_avg"] for m in done if m["res"].get("down_avg") is not None]
+    beat = [m["res"]["up_beat"] for m in done if m["res"].get("up_beat") is not None]
+    fell = [m["res"]["down_fell"] for m in done if m["res"].get("down_fell") is not None]
+    L = ["", B(f"☀️ Morning lists ({len(done)} days, 24h later)")]
+    if ups:
+        L.append(f"'Potential up' list: average {sum(ups) / len(ups):+.1f}% | beat BTC {sum(beat) / max(len(beat), 1) * 100:.0f}% of the time")
+    if dns:
+        L.append(f"'Dump risk' list: average {sum(dns) / len(dns):+.1f}% | fell {sum(fell) / max(len(fell), 1) * 100:.0f}% of the time")
+    return L
+
+
+def update_morning_outcomes(state):
+    """24h after each brief, measure what the two lists actually did (shown in the next brief)."""
+    tk, now = TICKERS["data"], time.time()
+    btc_now = (tk.get("BTC") or {}).get("price")
+    for m in state.get("morning_log") or []:
+        if m.get("res") or now - m["ts"] < 23 * 3600:
+            continue
+        btc = pct_change(btc_now, m.get("btc_price")) if btc_now and m.get("btc_price") else None
+
+        def rets(items):
+            out = []
+            for it in items:
+                px = (tk.get(it["coin"]) or {}).get("price")
+                if px:
+                    out.append(pct_change(px, it["price"]))
+            return out
+        up, dn = rets(m["up"]), rets(m["down"])
+        m["res"] = {"up_avg": (sum(up) / len(up)) if up else None, "down_avg": (sum(dn) / len(dn)) if dn else None,
+                    "btc": btc, "n_up": len(up), "n_down": len(dn),
+                    "up_beat": (sum(1 for x in up if btc is not None and x > btc) / len(up)) if up and btc is not None else None,
+                    "down_fell": (sum(1 for x in dn if x < 0) / len(dn)) if dn else None}
+
+
+def yesterday_text(state):
+    last = next((m for m in reversed(state.get("morning_log") or []) if m.get("res")), None)
+    if not last:
+        return []
+    r = last["res"]
+    parts = []
+    if r.get("up_avg") is not None:
+        parts.append(f"'up' list {r['up_avg']:+.1f}%")
+    if r.get("down_avg") is not None:
+        parts.append(f"'dump' list {r['down_avg']:+.1f}%")
+    if r.get("btc") is not None:
+        parts.append(f"BTC {r['btc']:+.1f}%")
+    return ["", B("Yesterday's lists, 24h later"), esc(" | ".join(parts)),
+            "<i>Check /scanstats for the running record - lists are ideas, not guarantees.</i>"] if parts else []
+
+
+def build_morning_brief(state, ups, downs, danger):
+    c = CTX
+    bias, plan = c["bias"], c["plan"]
+    ticker, tech, events = c.get("ticker") or {}, c.get("tech") or {}, c.get("events") or []
+    price = ticker.get("price") or (c.get("levels") or {}).get("price")
+    lt = local_now(state)
+    for detail_n in (3, 2, 1):
+        L = [B(f"☀️ MORNING BRIEF — {lt.strftime('%a %d %b')}"), esc(utc_text()), "━━━━━━━━━━━━━━━━━━━━",
+             f"BTC {esc(fmt_price(price))} ({esc(fmt_pct(ticker.get('change_24h')))}) | mood <b>{esc(bias['bias'])}</b> "
+             f"{strength_stars(bias['score'])} | signal: <b>{esc(plan['action'])}</b>",
+             f"Trend: 1d {arrow((tech.get('1d') or {}).get('trend'))} 4h {arrow((tech.get('4h') or {}).get('trend'))} "
+             f"1h {arrow((tech.get('1h') or {}).get('trend'))}"]
+        end = now_utc() + timedelta(hours=24)
+        today = [e for e in events if now_utc() <= e["time"] <= end][:3]
+        if today:
+            L.append("⏰ " + esc(" | ".join(f"{e['name']} {fmt_local(e['time'], '%H:%M')}" for e in today)))
+        note = liquidity_note()
+        if note:
+            L.append("⚠️ " + esc(note))
+
+        L += ["", B("🟢 POTENTIAL TO GO UP (technical + news)")]
+        if ups:
+            for i, u in enumerate(ups[:5], 1):
+                L += _up_block(i, u, i <= detail_n)
+        else:
+            L.append("Nothing clean today - no coin shows a convincing setup. Patience is a position.")
+        L += ["", B("🔴 AT RISK OF DUMPING")]
+        if downs:
+            for i, d in enumerate(downs[:5], 1):
+                L += _down_block(i, d, i <= detail_n)
+        else:
+            L.append("No coin shows a clear breakdown setup right now.")
+        if danger:
+            L += ["", B("🔥 Overheated after a big pump (pullback risk)")]
+            for d in danger[:3]:
+                L.append(f"• <b>{esc(d['coin'])}</b> {d['chg']:+.0f}% 24h - " + esc("; ".join(d["reasons"][:2])))
+        L += yesterday_text(state)
+        L += ["", "<i>Ideas to watch, not predictions or advice. Confirm with a candle close, use a stop, and keep size small on small coins.</i>"]
+        text = "\n".join(L)
+        if len(text) <= 3900:
+            return text
+    return text[:3900]
+
+
+def brief_buttons(ups, downs):
+    row1 = [{"text": f"🟢 {u['coin']}", "callback_data": f"an:{u['coin']}:1h"} for u in ups[:3]]
+    row2 = [{"text": f"🔴 {d['coin']}", "callback_data": f"an:{d['coin']}:1h"} for d in downs[:3]]
+    rows = [r for r in (row1, row2) if r]
+    rows.append([{"text": "🏁 Scoreboard", "callback_data": "scanstats"}])
+    return {"inline_keyboard": rows}
+
+
+def send_morning_brief(state, manual=False):
+    if not CTX.get("bias"):
+        if manual:
+            send("Still loading market data. Try again in a minute.")
+        return False
+    if time.time() - SCAN_CACHE["ts"] > 1800 or not SCAN_CACHE["finalists"]:
+        run_scan(state)
+    ups = sorted([c for c in SCAN_CACHE["finalists"] if not c.get("blocked") and c.get("total", 0) >= 40],
+                 key=lambda c: -c["total"])[:5]
+    downs = [d for d in run_downside_scan(state) if d["total"] >= 35][:5]
+    danger = SCAN_CACHE["danger"]
+    text = build_morning_brief(state, ups, downs, danger)
+    mid = tg_send_html(localize(text, state), brief_buttons(ups, downs), level="normal")
+    if mid and not manual:
+        m = state.setdefault("morning", {})
+        if m.get("msg"):
+            unpin_message(m["msg"])
+        pin_message(mid)
+        m["msg"] = mid
+    if not manual:
+        log = state.setdefault("morning_log", [])
+        log.append({"date": local_now(state).strftime("%Y-%m-%d"), "ts": time.time(),
+                    "btc_price": (TICKERS["data"].get("BTC") or {}).get("price"),
+                    "up": [{"coin": u["coin"], "price": u["price"]} for u in ups],
+                    "down": [{"coin": d["coin"], "price": d["price"]} for d in downs]})
+    return True
+
+
+def check_morning_brief(state):
+    m = state.setdefault("morning", {"on": True, "time": "07:30", "last": "", "msg": None})
+    if not m.get("on", True) or not CTX.get("bias") or not TICKERS["data"]:
+        return
+    lt = local_now(state)
+    today = lt.strftime("%Y-%m-%d")
+    try:
+        hh, mm = (int(x) for x in str(m.get("time", "07:30")).split(":"))
+    except Exception:
+        hh, mm = 7, 30
+    if m.get("last") == today or lt.hour * 60 + lt.minute < hh * 60 + mm:
+        return
+    if m.get("tries_date") != today:
+        m["tries_date"], m["tries"] = today, 0
+    if m["tries"] >= 3:
+        return
+    m["tries"] += 1
+    if send_morning_brief(state):
+        m["last"] = today
+
+
+def cmd_morning(state, args):
+    m = state.setdefault("morning", {"on": True, "time": "07:30", "last": "", "msg": None})
+    a = [x.lower() for x in args]
+    if a and a[0] == "off":
+        m["on"] = False
+        send("✅ Morning brief off.")
+    elif a and a[0] == "on":
+        m["on"] = True
+        send(f"✅ Morning brief on - every day at {m.get('time', '07:30')} ({state.get('tz', 'UTC')}).")
+    elif a and a[0] == "now":
+        send("☀️ Building the brief (scanning ~50 coins up and down, about 1-2 minutes)...", level="low")
+        send_morning_brief(state, manual=True)
+    elif a and re.match(r"^\d{1,2}:\d{2}$", a[0]):
+        h, mi = (int(x) for x in a[0].split(":"))
+        if h < 24 and mi < 60:
+            m["time"], m["on"] = f"{h:02d}:{mi:02d}", True
+            send(f"✅ Morning brief at {m['time']} ({state.get('tz', 'UTC')}), pinned every day.")
+        else:
+            send("Usage: /morning 07:30")
+    else:
+        send(f"☀️ Morning brief: {'ON at ' + m.get('time', '07:30') if m.get('on', True) else 'OFF'} "
+             f"({state.get('tz', 'UTC')}).\n/morning 07:30  |  /morning off  |  /morning now\n"
+             "Set your timezone first with /tz Asia/Karachi.")
+
+
+def cmd_dump(state):
+    send("🔴 Scanning ~50 liquid coins for breakdown risk (technical + positioning + news)...", level="low")
+    downs = run_downside_scan(state)
+    if not downs and not tickers():
+        send("Couldn't load coin data right now. Try again in a minute (see /health).")
+        return
+    danger = SCAN_CACHE["danger"] if time.time() - SCAN_CACHE["ts"] < 1800 else scan_danger(TICKERS["data"])
+    L = [B("🔴 COINS AT RISK OF DUMPING"), esc(utc_text()),
+         "<i>Breakdown setups and overheated pumps. A watch-list of risk - not a call to short.</i>", ""]
+    shown = [d for d in downs if d["total"] >= 35][:5]
+    if shown:
+        for i, d in enumerate(shown, 1):
+            L += _down_block(i, d, i <= 3) + [""]
+    else:
+        L += ["No coin shows a clear breakdown setup right now.", ""]
+    if danger:
+        L.append(B("🔥 Overheated after a big pump"))
+        L += [f"• <b>{esc(d['coin'])}</b> {d['chg']:+.0f}% 24h - " + esc("; ".join(d["reasons"][:2])) for d in danger[:3]]
+    tg_send_html("\n".join(L)[:3900], {"inline_keyboard": [[{"text": f"🔴 {d['coin']}", "callback_data": f"an:{d['coin']}:1h"}
+                                                          for d in shown[:3]]]} if shown else None, level="normal")
+
+
 _ANALYZE_RX = re.compile(r"\b(analy[sz]e|analysis|chart|technical|support|resistance)\b", re.I)
 
 
@@ -4709,6 +5148,13 @@ _SCAN_RX = re.compile(r"((which|what|any|best|top).{0,25}(coin|coins|crypto|toke
                       r"(pump|boost|breakout|break out|moon|explode|blow|run|buy|watch))|"
                       r"going to (pump|boost|blow|moon|explode)|breakout (scan|watch|coin|coins)|"
                       r"\b(blow up|about to pump|next pump|next big mover)\b", re.I)
+
+
+_DUMP_RX = re.compile(r"((which|what|any).{0,25}(coin|coins|crypto|token|tokens|altcoin|altcoins).{0,40}"
+                      r"(dump|crash|fall|drop|go down|bleed|tank|collapse))|about to dump|going to dump|next dump", re.I)
+
+
+_BRIEF_RX = re.compile(r"((morning|daily|today'?s?) (brief|report|update|summary))|brief me|\bmorning brief\b", re.I)
 
 
 _SCORE_RX = re.compile(r"(scoreboard|how accurate|scan stats|paper trad|how did (your|the) picks)", re.I)
@@ -5430,6 +5876,9 @@ HELP_TEXT = (
     "ASK ME (just type):\n"
     "• which coin may break out?\n• analyze SOL on 15m\n• why did DOGE pump today?\n"
     "• weekend outlook\n• top movers\n\n"
+    "MORNING BRIEF (pinned every morning)\n"
+    "/brief - coins with potential to go up + coins at risk of dumping, now\n"
+    "/dump - coins at risk of dumping | /morning 07:30 - set time, /morning off\n\n"
     "SCANNER & CHARTS\n"
     "/scan - coins where technicals + news line up (best one is pinned with a chart)\n"
     "/analyze SOL 15m - full chart analysis, any coin, 5m 15m 30m 1h 4h 1d 1w\n"
@@ -5550,6 +5999,12 @@ def handle_command(state, cmd, args):
         tg_send_html(scan_stats_text(state), None, level="normal")
     elif cmd == "/digest":
         cmd_digest(state, args)
+    elif cmd == "/brief":
+        send_morning_brief(state, manual=True)
+    elif cmd == "/dump":
+        cmd_dump(state)
+    elif cmd == "/morning":
+        cmd_morning(state, args)
     elif cmd == "/unwatch":
         cmd_watch(state, args, remove=True)
     elif cmd == "/alert":
@@ -5624,6 +6079,8 @@ def handle_update(state, u):
             cmd_analyze(state, data.split(":")[1:3])
         elif data == "scan":
             cmd_scan(state)
+        elif data == "scanstats":
+            tg_send_html(scan_stats_text(state), None, level="normal")
         elif data == "movers":
             cmd_movers(state)
         elif data == "details":
@@ -5851,7 +6308,7 @@ def send_startup(restart=False):
         send("🔄 Bot restarted after an error and is running again. Open trades are restored.")
         return
     send(
-        "₿ BTC MARKET BOT v3.4 STARTED\n"
+        "₿ BTC MARKET BOT v3.5 STARTED\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "• A clear action every 30 min: LONG / SHORT / WAIT\n"
         "• Headline card + tabs: Trend, Futures, Macro, News, Levels, Stats\n"
@@ -5919,6 +6376,7 @@ def run_bot(state, deadline, restart=False):
                     update_scan_outcomes(state)
                     check_near_levels(state)
                     flush_digest(state)
+                    update_morning_outcomes(state)
                 except Exception:
                     traceback.print_exc()
                 t_tick = now
@@ -5963,6 +6421,7 @@ def run_bot(state, deadline, restart=False):
                 process_signal(state, plan, bias, live_price)
                 update_trade_pin(state, live_price)
                 check_daily_plan(state)
+                check_morning_brief(state)
 
                 if state["last_report"] == 0 or now - state["last_report"] >= REPORT_INTERVAL:
                     send_market_report(state)
