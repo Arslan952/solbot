@@ -24,6 +24,7 @@ def _reset():
     bot.CANDLES.clear()
     bot.CTX.clear()
     bot.SCAN_CACHE.update(ts=0, picks=[], finalists=[], danger=[])
+    bot.KLINE_CACHE.clear()
 
 
 def candles(n=260, step=3600, seed=1, sigma=0.4, drift=0.0, tail=None):
@@ -116,6 +117,7 @@ def test_scenarios_are_consistent_with_price():
         assert all(t > px for t in an["bull"]["targets"]), (seed, an["bull"], px)
         assert all(t < px for t in an["bear"]["targets"]), (seed, an["bear"], px)
         assert an["bull"]["active"] == (px > an["bull"]["trigger"])
+        assert an["bull"]["invalid"] < an["bull"]["trigger"] and an["bear"]["invalid"] > an["bear"]["trigger"]
         html = bot.analysis_html("X", "1h", an, {})
         assert ("already under way" in html) == (an["bull"]["active"] or an["bear"]["active"])
 
