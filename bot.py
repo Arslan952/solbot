@@ -23,7 +23,7 @@ import requests
 
 
 # ============================================================
-# BTC MARKET INTELLIGENCE TELEGRAM BOT  (v3.5)
+# BTC MARKET INTELLIGENCE TELEGRAM BOT  (v3.6)
 # ------------------------------------------------------------
 #  1. Signal tracking: every LONG/SHORT is logged and followed
 #     until it hits stop / TP1 / TP2; win-rate + R stats
@@ -37,7 +37,8 @@ import requests
 #     Claude summary (ANTHROPIC_API_KEY)
 #  7. Telegram commands/buttons/charts, crash alerts, health
 #     checks, atomic state saves
-#  8. NEW: headline card + tabs (Trend / Futures / Macro / News /
+#  9. NEW v3.6: multi-coin cards (/coins, /card, /cards): BUY / SELL / WAIT / NO TRADE per coin
+#  8. headline card + tabs (Trend / Futures / Macro / News /
 #     Levels / Stats / Glossary) that edit one message in place
 #
 #  Signals are informational only. NO ORDERS ARE PLACED.
@@ -399,6 +400,7 @@ def default_state():
         "digest": {"on": False, "hours": 3, "last": 0, "queue": []},
         "morning": {"on": True, "time": "07:30", "last": "", "msg": None},
         "morning_log": [],
+        "cards": {},
     }
 
 
@@ -2348,6 +2350,8 @@ BOT_COMMANDS = [
     ("trade", "Current trade"), ("stats", "Track record"), ("status", "Bot status"),
     ("health", "Data source health"), ("tz", "Set timezone /tz Asia/Karachi"),
     ("quiet", "Quiet hours /quiet 00:00-07:00"), ("lang", "Language en|simple|ur"),
+    ("coins", "Choose coins to monitor /coins add PEPE"), ("card", "Full BUY/SELL/WAIT card /card SOL 4h"),
+    ("cards", "Cards for all selected coins"), ("cardstats", "Record of coin card signals"),
     ("help", "All commands"),
 ]
 
@@ -2484,6 +2488,9 @@ def _trim_state(state):
     state["scan_log"] = (state.get("scan_log") or [])[-400:]
     state["listing_seen"] = (state.get("listing_seen") or [])[-300:]
     state["morning_log"] = (state.get("morning_log") or [])[-60:]
+    cc = state.get("cards")
+    if isinstance(cc, dict):
+        cc["signals"] = (cc.get("signals") or [])[-300:]
     dg = state.get("digest")
     if isinstance(dg, dict):
         dg["queue"] = (dg.get("queue") or [])[-40:]
@@ -3655,6 +3662,9 @@ def handle_text(state, text):
         handle_command(state, "/trade", [])
         return
     coin = detect_coin(t)
+    if coin and _CARD_SIG_RX.search(low):
+        cmd_card(state, [coin, parse_tf(low) or card_cfg(state)["tf"]])
+        return
     if _ANALYZE_RX.search(low):
         cmd_analyze(state, [coin or "BTC", parse_tf(low) or "1h"])
         return
@@ -5868,6 +5878,915 @@ def send_document(path, caption=""):
 
 
 # ============================================================
+# v3.6 MULTI-COIN ANALYSIS CARDS
+# One card per selected coin: market overview, multi-timeframe trend, indicators, support / resistance,
+# trade plan, risk, news - and a BUY / SELL / WAIT / NO TRADE decision that explains itself.
+# Informational only: nothing here places an order. Missing data is never counted as a positive signal.
+# ============================================================
+
+CARD_TFS = ["15m", "1h", "4h", "1d", "1w"]
+CARD_TREND_ROW = ["1d", "4h", "1h", "15m"]
+CARD_POPULAR = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX"]
+CARD_DEFAULT_COINS = ["BTC", "ETH", "SOL"]
+CARD_INTERVALS = [0, 15, 30, 60, 240]                    # minutes between automatic checks (0 = off)
+CARD_MAX_COINS = int(os.environ.get("CARD_MAX_COINS", "8"))
+CARD_MIN_VOL = float(os.environ.get("CARD_MIN_VOL", "5000000"))     # min 24h USDT volume
+CARD_MAX_SPREAD = float(os.environ.get("CARD_MAX_SPREAD", "0.15"))  # max bid/ask spread, % of price
+CARD_MAX_STOP_PCT = 12.0       # a stop wider than this % of price = too risky to size sensibly
+CARD_MAX_FEE_R = 0.25          # fees above 25% of the risked amount = not worth taking
+CARD_SCORE_MIN = 45            # |score| needed before BUY / SELL is even considered
+CARD_SPOT_FEE = 0.001          # 0.10% per side (typical spot taker)
+CARD_KL_TTL = 120              # seconds a candle download is reused
+CARD_EXPIRE_H = {"15m": 12, "1h": 48, "4h": 120, "1d": 480, "1w": 1500}   # tracked signal lifetime
+CARD_TREND_W = {"1d": 9.0, "4h": 9.0, "1h": 8.0, "15m": 4.0}
+CARD_TREND_VAL = {"BULLISH": 1.0, "WEAK BULLISH": 0.5, "NEUTRAL": 0.0, "WEAK BEARISH": -0.5, "BEARISH": -1.0}
+CARD_TREND_NAME = {"BULLISH": "Bullish", "WEAK BULLISH": "Weak bullish", "NEUTRAL": "Neutral",
+                   "WEAK BEARISH": "Weak bearish", "BEARISH": "Bearish"}
+_CARD_SIG_RX = re.compile(r"\b(should i (buy|sell)|buy or sell|buy signal|sell signal|signal|trade setup|"
+                          r"entry|stop.?loss|take.?profit)\b", re.I)
+
+
+# ---------- settings (stored in state["cards"], created on first use) ----------
+
+def card_cfg(state):
+    c = state.setdefault("cards", {})
+    c.setdefault("coins", list(CARD_DEFAULT_COINS))
+    c.setdefault("tf", "1h")
+    c.setdefault("mode", "spot")            # spot = no shorting, futures = SELL gives a short plan
+    c.setdefault("every", 60)               # minutes between automatic checks (0 = off)
+    c.setdefault("alerts", True)
+    c.setdefault("last_run", 0)
+    c.setdefault("last_action", {})
+    c.setdefault("signals", [])
+    c.setdefault("seq", 0)
+    return c
+
+
+def card_base(raw):
+    """'sol', 'SOL/USDT', 'solusdt', '$sol', 'solana' -> 'SOL'."""
+    r = str(raw).strip().lstrip("$")
+    if r.lower() in NAME_TO_SYM:
+        return NAME_TO_SYM[r.lower()]
+    r = r.upper().replace("-", "/")
+    if "/" in r:
+        r = r.split("/")[0]
+    elif r.endswith("USDT") and len(r) > 4:
+        r = r[:-4]
+    return r
+
+
+# ---------- data ----------
+
+def card_frame(base, tf, ttl=CARD_KL_TTL):
+    """Candles + indicators (+ EMA20) for one coin / timeframe, or None when there is too little data."""
+    df = cached_klines(tf, 300, base + "USDT", ttl=ttl)
+    if df is None or len(df) < 60:
+        return None
+    df = add_indicators(df)
+    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+    return df
+
+
+def card_spread(base):
+    """Bid/ask spread in % of price (None if unavailable)."""
+    sym = base + "USDT"
+    for host in BINANCE_SPOT_HOSTS:
+        d = http_json(host + "/api/v3/ticker/bookTicker", {"symbol": sym})
+        if isinstance(d, dict) and d.get("bidPrice"):
+            bid, ask = safe_float(d.get("bidPrice")), safe_float(d.get("askPrice"))
+            if bid and ask and bid > 0 and ask >= bid:
+                return (ask - bid) / ((ask + bid) / 2) * 100
+    d = http_json(OKX + "/api/v5/market/ticker", {"instId": f"{base}-USDT"})
+    try:
+        t = d["data"][0]
+        bid, ask = safe_float(t.get("bidPx")), safe_float(t.get("askPx"))
+        if bid and ask and bid > 0 and ask >= bid:
+            return (ask - bid) / ((ask + bid) / 2) * 100
+    except Exception:
+        pass
+    return None
+
+
+def card_macd(df):
+    """MACD (12/26/9) read on the last CLOSED candle."""
+    if df is None or len(df) < 40:
+        return None
+    c = df["close"]
+    macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
+    sig = macd.ewm(span=9, adjust=False).mean()
+    hist = macd - sig
+    m, s, pm, ps = (float(x) for x in (macd.iloc[-2], sig.iloc[-2], macd.iloc[-3], sig.iloc[-3]))
+    h0, h1 = float(hist.iloc[-2]), float(hist.iloc[-3])
+    if pm <= ps and m > s:
+        return {"label": "Bullish crossover", "dir": 1, "cross": True, "hist": h0}
+    if pm >= ps and m < s:
+        return {"label": "Bearish crossover", "dir": -1, "cross": True, "hist": h0}
+    if m > s:
+        return {"label": "Bullish (momentum " + ("rising" if h0 > h1 else "fading") + ")",
+                "dir": 1, "cross": False, "hist": h0, "moving": h0 > h1}
+    return {"label": "Bearish (momentum " + ("falling" if h0 < h1 else "easing") + ")",
+            "dir": -1, "cross": False, "hist": h0, "moving": h0 < h1}
+
+
+def card_breakout_state(df, an):
+    """Breakout / retest confirmation from the last 8 closed candles.
+    dir: +1 / -1 supports that side, 0 = nothing useful. kind: retest | breakout | failed | none."""
+    none = {"dir": 0, "kind": "none", "text": "No fresh breakout - price is inside its range"}
+    try:
+        closed = df.iloc[:-1].reset_index(drop=True)
+        n, atr = len(closed), an["atr"]
+        if n < 40:
+            return none
+        for j in range(n - 2, n - 9, -1):                       # most recent breakout candle first
+            hi_lvl = float(closed["high"].iloc[j - 20:j].max())
+            lo_lvl = float(closed["low"].iloc[j - 20:j].min())
+            after = closed.iloc[j + 1:]
+            last = float(closed["close"].iloc[-1])
+            if float(closed["close"].iloc[j]) > hi_lvl:
+                if last < hi_lvl:
+                    return {"dir": -1, "kind": "failed", "text": f"Failed breakout above {fmt_price(hi_lvl)} (back inside range)"}
+                if len(after) and float(after["low"].min()) <= hi_lvl + 0.5 * atr:
+                    return {"dir": 1, "kind": "retest", "text": f"Breakout above {fmt_price(hi_lvl)} retested and holding"}
+                return {"dir": 1, "kind": "breakout", "text": f"Broke above {fmt_price(hi_lvl)}, no retest yet (can chase-fail)"}
+            if float(closed["close"].iloc[j]) < lo_lvl:
+                if last > lo_lvl:
+                    return {"dir": 1, "kind": "failed", "text": f"Failed breakdown below {fmt_price(lo_lvl)} (back inside range)"}
+                if len(after) and float(after["high"].max()) >= lo_lvl - 0.5 * atr:
+                    return {"dir": -1, "kind": "retest", "text": f"Breakdown below {fmt_price(lo_lvl)} retested and rejected"}
+                return {"dir": -1, "kind": "breakout", "text": f"Broke below {fmt_price(lo_lvl)}, no retest yet"}
+    except Exception:
+        pass
+    return none
+
+
+def card_news_read(items):
+    """Score coin headlines. Pure function: items = [{'title', 'description'}]."""
+    text = " ".join(i.get("title", "") for i in items or [])
+    pos, neg, tags_pos, tags_neg, blocked = 0.0, 0.0, [], [], False
+    for name, rx in _CAT_RX.items():
+        if not rx.search(text):
+            continue
+        if name in POS_TAGS:
+            pos += POS_TAGS[name]
+            tags_pos.append(name)
+        if name in NEG_TAGS:
+            neg += NEG_TAGS[name]
+            tags_neg.append(name)
+            if name in ("hack / exploit", "delisting"):
+                blocked = True
+    rumor = bool(items) and bool(_RUMOR_RX.search(text))
+    pts = clamp(min(pos, 10) + max(neg, -10), -5, 5) * (0.5 if rumor else 1.0)
+    return {"pts": pts, "pos": tags_pos, "neg": tags_neg, "blocked": blocked, "rumor": rumor,
+            "headlines": [i.get("title", "")[:90] for i in (items or [])[:2]], "none": not items}
+
+
+def card_gather(base, tf):
+    """Everything one card needs, fetched once. Anything that fails is listed in d['missing']."""
+    tk = tickers().get(base) or {}
+    d = {"base": base, "tf": tf, "ts": time.time(), "tk": tk, "missing": [], "trends": {}}
+    frames = {}
+    for t in dict.fromkeys(CARD_TREND_ROW + [tf]):
+        frames[t] = card_frame(base, t)
+    for t in CARD_TREND_ROW:
+        f = frames.get(t)
+        d["trends"][t] = snapshot(f.iloc[-2])["trend"] if f is not None else None
+        if f is None:
+            d["missing"].append(f"{t.upper()} trend")
+    main = frames.get(tf)
+    d["df"] = main
+    d["an"] = analyze_df(main, tf) if main is not None else None
+    an = d["an"]
+    d["price"] = tk.get("price") or (an["price"] if an else None)
+    if an:
+        s = an["snap"]
+        d.update(rsi=s["rsi"], adx=s["adx"], ema50=s["ema50"], vol_ratio=an["vol_ratio"], vwap=an["vwap"],
+                 ema20=safe_float(main["ema20"].iloc[-2]),
+                 ema200=s["ema200"] if len(main) >= 200 else None,
+                 candle_dir=1 if float(main["close"].iloc[-2]) >= float(main["open"].iloc[-2]) else -1,
+                 macd=card_macd(main), bs=card_breakout_state(main, an))
+        if d["ema200"] is None:
+            d["missing"].append("EMA200 (coin too new for this timeframe)")
+        if d["macd"] is None:
+            d["missing"].append("MACD")
+    else:
+        d["missing"].append(f"{tf} candles")
+    d["spread"] = card_spread(base)
+    if d["spread"] is None:
+        d["missing"].append("bid/ask spread")
+    d["derivs"] = coin_derivs(base)
+    if d["derivs"].get("funding") is None and d["derivs"].get("oi_change_24h") is None:
+        d["missing"].append("funding / open interest")
+    try:
+        d["news"] = card_news_read(coin_news(base))
+    except Exception:
+        d["news"] = card_news_read([])
+        d["missing"].append("news")
+    ev = upcoming_high_event(CTX.get("events"), NO_TRADE_BEFORE_EVENT_MIN)
+    d["event"] = (ev[0]["name"], int(ev[1])) if ev else None
+    return d
+
+
+# ---------- decision ----------
+
+def _card_rsi_pts(rsi):
+    """Long-side points from RSI (negative = favours sellers). Overbought / oversold are penalised."""
+    if rsi is None:
+        return 0.0
+    if rsi >= 78:
+        return -4.0
+    if rsi >= 70:
+        return 1.0
+    if rsi >= 55:
+        return 6.0
+    if rsi >= 50:
+        return 3.0
+    if rsi >= 45:
+        return -3.0
+    if rsi >= 30:
+        return -6.0
+    if rsi >= 22:
+        return -1.0
+    return 4.0
+
+
+def card_trade_plan(d, direction, mode, account, risk_pct):
+    """Entry / stop / targets / size / fees for one coin. Returns (plan, blockers, needs):
+    blockers = risk problems (-> NO TRADE), needs = missing room / confirmation (-> WAIT)."""
+    an, price = d["an"], d["price"]
+    atr = an["atr"]
+    problems, needs = [], []
+    if direction > 0:
+        near = an["supports"][0][0] if an["supports"] else None
+        stop = near - 0.25 * atr if near is not None else None
+        if stop is None or not (0.8 * atr <= price - stop <= 3 * atr):
+            stop = price - 1.5 * atr
+        risk = price - stop
+        wall = an["resistances"][0][0] if an["resistances"] else None
+        room_r = (wall - price) / risk if wall else None
+    else:
+        near = an["resistances"][0][0] if an["resistances"] else None
+        stop = near + 0.25 * atr if near is not None else None
+        if stop is None or not (0.8 * atr <= stop - price <= 3 * atr):
+            stop = price + 1.5 * atr
+        risk = stop - price
+        wall = an["supports"][0][0] if an["supports"] else None
+        room_r = (price - wall) / risk if wall else None
+    if risk <= 0 or price <= 0:
+        return None, ["could not compute a valid stop"], []
+    tp1, tp2 = price + direction * RR1 * risk, price + direction * RR2 * risk
+    stop_pct = risk / price * 100
+    risk_usd = account * risk_pct / 100
+    qty = risk_usd / risk
+    cap = account * (1.0 if mode == "spot" else MAX_LEVERAGE)
+    capped = qty * price > cap
+    if capped:
+        qty = cap / price
+    notional = qty * price
+    real_risk = qty * risk
+    fee_rate = CARD_SPOT_FEE if mode == "spot" else FEE_RATE
+    fees = notional * fee_rate * 2
+    fees_r = fees / real_risk if real_risk > 0 else 9.0
+    if stop_pct > CARD_MAX_STOP_PCT:
+        problems.append(f"stop would be {stop_pct:.1f}% away (more than {CARD_MAX_STOP_PCT:.0f}%)")
+    if fees_r > CARD_MAX_FEE_R:
+        problems.append(f"fees would eat {fees_r * 100:.0f}% of the risked amount (stop too tight)")
+    if room_r is not None and room_r < 1.0:
+        needs.append(f"room to run: {'resistance' if direction > 0 else 'support'} {fmt_price(wall)} is only {room_r:.1f}R away "
+                     f"(wait for a close {'above' if direction > 0 else 'below'} it, then a retest)")
+    plan = {"dir": direction, "entry": price, "stop": stop, "tp1": tp1, "tp2": tp2, "risk": risk,
+            "stop_pct": stop_pct, "rr1": RR1, "rr2": RR2, "net_rr1": RR1 - fees_r, "net_rr2": RR2 - fees_r,
+            "qty": qty, "notional": notional, "capped": capped, "fees": fees, "fees_r": fees_r,
+            "risk_usd": real_risk, "risk_acct_pct": real_risk / account * 100 if account else None,
+            "room_r": room_r, "wall": wall}
+    return plan, problems, needs
+
+
+def card_decide(d, mode="spot", account=ACCOUNT_DEFAULT, risk_pct=RISK_PCT_DEFAULT):
+    """Turns gathered data into BUY / SELL / WAIT / NO TRADE with the reasons.
+    Score runs from about -100 (very bearish) to +100 (very bullish). Missing inputs add 0 points
+    and lower the confidence; they can never push a signal towards BUY or SELL."""
+    r = {"action": "WAIT", "score": 0.0, "confidence": 0, "plan": None, "blockers": [], "needs": [],
+         "pro": [], "con": [], "missing": list(d["missing"]), "mode": mode}
+    an, price, tk = d.get("an"), d.get("price"), d.get("tk") or {}
+
+    # ---- safety filters first (-> NO TRADE) ----
+    if an is None or not price:
+        r["action"] = "NO TRADE"
+        r["blockers"].append("not enough candle / price data to analyse safely")
+        return r
+    qv = tk.get("quote_vol")
+    if qv is None:
+        r["missing"].append("24h volume")
+    elif qv < CARD_MIN_VOL:
+        r["blockers"].append(f"24h volume only {_fmt_usd(qv)} (minimum {_fmt_usd(CARD_MIN_VOL)}) - too thin")
+    if d.get("spread") is not None and d["spread"] > CARD_MAX_SPREAD:
+        r["blockers"].append(f"bid/ask spread {d['spread']:.2f}% is wider than {CARD_MAX_SPREAD:.2f}%")
+    if d.get("event"):
+        r["blockers"].append(f"high-impact event '{d['event'][0]}' within {max(d['event'][1], 0)} min - spreads and whipsaws")
+
+    # ---- score (long-positive) ----
+    s = 0.0
+    tr_pts, tr_txt, tr_sum = 0.0, [], 0.0
+    for t in CARD_TREND_ROW:
+        v = CARD_TREND_VAL.get(d["trends"].get(t))
+        if v is None:
+            continue
+        tr_pts += CARD_TREND_W[t] * v
+        tr_sum += CARD_TREND_W[t] * v if t != "15m" else 0
+        tr_txt.append(f"{t.upper()} {CARD_TREND_NAME[d['trends'][t]].lower()}")
+    s += tr_pts
+    if tr_txt:
+        (r["pro"] if tr_pts > 2 else r["con"] if tr_pts < -2 else []).append(
+            f"Trend: {', '.join(tr_txt)} ({tr_pts:+.0f})")
+    trend_dir = 1 if tr_sum > 0 else -1 if tr_sum < 0 else 0
+
+    e_pts = 0.0
+    for name, w in (("ema20", 3), ("ema50", 3), ("ema200", 4)):
+        val = d.get(name)
+        if val:
+            e_pts += w if price > val else -w
+    s += e_pts
+    if d.get("ema20") and d.get("ema50"):
+        (r["pro"] if e_pts >= 6 else r["con"] if e_pts <= -6 else []).append(
+            f"Price {'above' if e_pts > 0 else 'below'} most EMAs (20/50/200) ({e_pts:+.0f})")
+
+    m = d.get("macd")
+    if m:
+        m_pts = m["dir"] * (10 if m["cross"] else 6 if m.get("moving") else 3)
+        s += m_pts
+        (r["pro"] if m_pts > 0 else r["con"]).append(f"MACD: {m['label'].lower()} ({m_pts:+.0f})")
+
+    rp = _card_rsi_pts(d.get("rsi"))
+    s += rp
+    if d.get("rsi") is not None and rp:
+        (r["pro"] if rp > 0 else r["con"]).append(f"RSI {d['rsi']:.0f} ({rp:+.0f})")
+
+    adx = d.get("adx")
+    if adx is not None:
+        if adx >= 25:
+            a_pts = 7.0 * trend_dir
+        elif adx >= 18:
+            a_pts = 3.5 * trend_dir
+        else:
+            a_pts = 0.0
+        s += a_pts
+        if a_pts:
+            (r["pro"] if a_pts > 0 else r["con"]).append(f"ADX {adx:.0f}: trend has strength ({a_pts:+.1f})")
+
+    vr = d.get("vol_ratio")
+    if vr is not None and vr >= 1.1:
+        v_pts = (8.0 if vr >= 1.5 else 4.0) * d.get("candle_dir", 0)
+        s += v_pts
+        (r["pro"] if v_pts > 0 else r["con"]).append(f"Volume {vr:.1f}x average on a {'green' if v_pts > 0 else 'red'} candle ({v_pts:+.0f})")
+
+    if d.get("vwap"):
+        w_pts = 4.0 if price > d["vwap"] else -4.0
+        s += w_pts
+        (r["pro"] if w_pts > 0 else r["con"]).append(f"Price {'above' if w_pts > 0 else 'below'} VWAP ({w_pts:+.0f})")
+
+    bs = d.get("bs") or {}
+    b_pts = {"retest": 8.0, "breakout": 4.0, "failed": 6.0}.get(bs.get("kind"), 0.0) * bs.get("dir", 0)
+    s += b_pts
+    if b_pts:
+        (r["pro"] if b_pts > 0 else r["con"]).append(f"{bs['text']} ({b_pts:+.0f})")
+
+    dv = d.get("derivs") or {}
+    f_ = dv.get("funding")
+    if f_ is not None:
+        if f_ > 0.0005:
+            s -= 5
+            r["con"].append(f"Funding {f_ * 100:+.3f}% - longs are crowded (-5)")
+        elif f_ < -0.0003:
+            s += 3
+            r["pro"].append(f"Funding {f_ * 100:+.3f}% - shorts are crowded, squeeze fuel (+3)")
+
+    nw = d.get("news") or {}
+    s += nw.get("pts", 0.0)
+    if nw.get("pts"):
+        (r["pro"] if nw["pts"] > 0 else r["con"]).append(
+            "News: " + ", ".join(nw["pos"] + nw["neg"]) + (" (rumor wording, halved)" if nw.get("rumor") else "")
+            + f" ({nw['pts']:+.0f})")
+
+    if adx is not None and adx < 18:
+        s *= 0.6
+        r["con"].append(f"ADX {adx:.0f}: market is ranging, directional score cut by 40%")
+    s = clamp(s, -100, 100)
+    r["score"] = s
+
+    # ---- direction + confirmations ----
+    cand = 1 if s >= CARD_SCORE_MIN else -1 if s <= -CARD_SCORE_MIN else 0
+    tr4, tr1, tr1d = d["trends"].get("4h"), d["trends"].get("1h"), d["trends"].get("1d")
+    if cand:
+        up = cand > 0
+        bad = BEAR_TRENDS if up else BULL_TRENDS
+        side = "bearish" if up else "bullish"
+        if tr4 is None:
+            r["needs"].append("4H trend data (cannot confirm without it)")
+        elif tr4 in bad:
+            r["needs"].append(f"4H trend is {side} - wait for it to turn")
+        if tr1d is not None and tr1d == ("BEARISH" if up else "BULLISH"):
+            r["needs"].append(f"1D trend is strongly {side}")
+        if tr1 in bad:
+            r["needs"].append(f"1H trend is {side}")
+        if adx is None or adx < ADX_MIN:
+            r["needs"].append("trend strength (ADX 18+)" if adx is not None else "ADX data")
+        rsi = d.get("rsi")
+        if rsi is not None and ((up and rsi >= 78) or (not up and rsi <= 22)):
+            r["needs"].append(f"RSI {rsi:.0f} is {'overbought' if up else 'oversold'} - wait for a pullback")
+        ref = d.get("ema20")
+        if ref and abs(price - ref) > 3 * an["atr"] and (price > ref) == up:
+            r["needs"].append("price is stretched far from its EMA20 (chasing risk) - wait for a pullback")
+        if vr is not None and vr < 0.8:
+            r["needs"].append(f"volume ({vr:.1f}x average) - buyers/sellers not participating")
+        if up and nw.get("blocked"):
+            r["blockers"].append("negative headline (" + ", ".join(nw["neg"]) + ") - news risk")
+        if not up and mode == "spot":
+            pass                                                   # no plan in spot; handled below
+        else:
+            plan, problems, room_needs = card_trade_plan(d, cand, mode, account, risk_pct)
+            r["blockers"] += problems
+            r["needs"] += room_needs
+            r["plan"] = plan
+
+    # ---- final label ----
+    miss_pen = max(0.6, 1 - 0.05 * len(r["missing"]))
+    r["confidence"] = int(clamp(abs(s) * miss_pen, 0, 100))
+    if r["blockers"]:
+        r["action"], r["plan"], r["confidence"] = "NO TRADE", None, 0
+    elif not cand or r["needs"]:
+        r["action"], r["plan"] = "WAIT", None
+        if not cand:
+            r["needs"].insert(0, f"a clearer edge (score {s:+.0f}, needs {CARD_SCORE_MIN}+ for BUY or {-CARD_SCORE_MIN} for SELL)")
+    else:
+        r["action"] = "BUY" if cand > 0 else "SELL"
+        if r["action"] == "SELL" and mode == "spot":
+            r["plan"] = None
+    return r
+
+
+# ---------- text ----------
+
+def _fmt_usd(v):
+    if v is None:
+        return "n/a"
+    for lim, suf in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(v) >= lim:
+            return f"${v / lim:.2f}{suf}"
+    return f"${v:.0f}"
+
+
+def _liq_label(qv, spread):
+    if qv is None:
+        return "unknown"
+    lab = "deep" if qv >= 1e8 else "good" if qv >= 2e7 else "thin" if qv >= CARD_MIN_VOL else "very thin"
+    if spread is not None and spread > CARD_MAX_SPREAD:
+        lab += ", wide spread"
+    return lab
+
+
+ACTION_HEAD = {"BUY": "🟢 BUY SETUP", "SELL": "🔴 SELL SETUP", "WAIT": "🟡 WAIT", "NO TRADE": "⛔ NO TRADE"}
+
+
+def card_html(d, r, compact=False):
+    base, tf, mode = d["base"], d["tf"], r["mode"]
+    an, tk, price = d.get("an"), d.get("tk") or {}, d.get("price")
+    act = r["action"]
+    head = ACTION_HEAD[act]
+    if act == "SELL" and mode == "spot":
+        head = "🔴 SELL / AVOID (spot: exit or stay out)"
+    L = [f"<b>{esc(base)}/USDT</b> · <b>{esc(head)}</b>",
+         f"<b>{esc(fmt_price(price))}</b>  {esc(fmt_pct(tk.get('change_24h')))} · 24h  |  {esc(tf.upper())} analysis · "
+         f"{'Spot' if mode == 'spot' else 'Futures'} mode", ""]
+
+    L.append(B("1. Market overview"))
+    L.append(f"24h high / low: {esc(fmt_price(tk.get('high')))} / {esc(fmt_price(tk.get('low')))}")
+    spread_txt = "n/a" if d.get("spread") is None else format(d["spread"], ".3f") + "%"
+    L.append(f"Volume: {esc(_fmt_usd(tk.get('quote_vol')))} | Spread: {esc(spread_txt)} | Liquidity: "
+             f"{esc(_liq_label(tk.get('quote_vol'), d.get('spread')))}")
+
+    L += ["", B("2. Trend analysis")]
+    L.append(" · ".join(f"{t.upper()} {arrow(d['trends'][t]) if d['trends'].get(t) else '❔'} "
+                         f"{esc(CARD_TREND_NAME.get(d['trends'].get(t), 'n/a'))}" for t in CARD_TREND_ROW))
+
+    L += ["", B(f"3. Technical indicators ({tf.upper()})")]
+    if an:
+        def rel(val):
+            return "n/a" if not val else f"{fmt_price(val)} ({'above' if price > val else 'below'})"
+        L.append(f"RSI: {_num(d.get('rsi'))} | ADX: {_num(d.get('adx'))} | Volume: "
+                 f"{'n/a' if d.get('vol_ratio') is None else format(d['vol_ratio'], '.1f') + 'x avg'}")
+        L.append(f"EMA 20: {esc(rel(d.get('ema20')))}")
+        L.append(f"EMA 50: {esc(rel(d.get('ema50')))} | EMA 200: {esc(rel(d.get('ema200')))}")
+        L.append(f"MACD: {esc(d['macd']['label'] if d.get('macd') else 'n/a')}")
+        L.append("VWAP: " + (esc(rel(d['vwap'])) if d.get("vwap") else "n/a (daily VWAP only on intraday timeframes)"))
+
+        L += ["", B("4. Support and resistance")]
+        for lvl, n_ in an["supports"][:1 if compact else 2]:
+            L.append(f"Support: {esc(_dist(lvl, price))} · {n_} touch{'es' if n_ != 1 else ''}")
+        for lvl, n_ in an["resistances"][:1 if compact else 2]:
+            L.append(f"Resistance: {esc(_dist(lvl, price))} · {n_} touch{'es' if n_ != 1 else ''}")
+        if not an["supports"] and not an["resistances"]:
+            L.append("No clear levels (price at range extreme)")
+        L.append(f"Confirmation: {esc((d.get('bs') or {}).get('text', 'n/a'))}")
+
+    L += ["", B("5. Trade plan")]
+    p = r["plan"]
+    if p:
+        sd = "LONG" if p["dir"] > 0 else "SHORT"
+        L.append(f"{sd} · Entry {esc(fmt_price(p['entry']))} (market; or wait for a small pullback)")
+        L.append(f"Stop-loss: {esc(fmt_price(p['stop']))} ({-p['stop_pct'] * p['dir']:+.1f}%)")
+        L.append(f"Take-profit 1: {esc(fmt_price(p['tp1']))} ({p['rr1']}R) · take-profit 2: {esc(fmt_price(p['tp2']))} ({p['rr2']}R)")
+    elif act == "SELL" and mode == "spot":
+        L.append("Spot mode has no short trade. If you hold it, consider reducing or exiting; if not, stay out.")
+        if an:
+            L.append(f"Bearish confirmed while price stays below {esc(fmt_price(an['bear']['invalid']))}.")
+    else:
+        L.append("No trade plan - " + ("blocked by safety filter." if act == "NO TRADE" else "waiting for confirmation."))
+
+    L += ["", B("6. Risk analysis")]
+    if p:
+        L.append(f"Risk/reward: {p['rr1']}:1 to TP1 ({p['net_rr1']:.2f} after fees), {p['rr2']}:1 to TP2")
+        L.append(f"Position size: {p['qty']:.6g} {esc(base)} (~{esc(_fmt_usd(p['notional']))})" + (" · capped by max size" if p["capped"] else ""))
+        L.append(f"Estimated fees (round trip): ${p['fees']:.2f} | Risk: ${p['risk_usd']:.2f} = {p['risk_acct_pct']:.2f}% of account")
+    else:
+        L.append("n/a - no active plan")
+
+    L += ["", B("7. News and market conditions")]
+    nw = d.get("news") or {}
+    if nw.get("none"):
+        L.append("No coin-specific headlines found (not counted as positive or negative)")
+    else:
+        for tg_ in nw.get("pos", []):
+            L.append(f"🟢 Headline catalyst: {esc(tg_)}")
+        for tg_ in nw.get("neg", []):
+            L.append(f"🔴 Negative headline: {esc(tg_)}")
+        if nw.get("rumor"):
+            L.append("⚠️ Headline wording is rumor / unconfirmed")
+        if not compact:
+            for h in nw.get("headlines", []):
+                L.append(f"• {esc(h)}")
+    L.append("Economic event: " + (f"⚠️ {esc(d['event'][0])} in ~{max(d['event'][1], 0)} min" if d.get("event")
+                                    else "none in the next 45 min"))
+    dv = d.get("derivs") or {}
+    if dv.get("funding") is None and dv.get("oi_change_24h") is None:
+        L.append("Funding / open interest: not available for this coin")
+    else:
+        L.append(f"Funding: {'n/a' if dv.get('funding') is None else format(dv['funding'] * 100, '+.3f') + '%'}"
+                 f" | Open interest 24h: {esc(fmt_pct(dv.get('oi_change_24h'), 1))}")
+
+    L += ["", B(f"Decision: {act}")]
+    if r["blockers"]:
+        L += ["⛔ " + esc(x) for x in r["blockers"][:3 if compact else 5]]
+    elif act in ("BUY", "SELL"):
+        L += ["✅ " + esc(x) for x in (r["pro"] if act == "BUY" else r["con"])[:3 if compact else 4]]
+        L.append("Risks: " + esc("; ".join(x for x in (r["con"] if act == "BUY" else r["pro"])[:2]) or "none flagged"))
+    else:
+        L += ["⏳ Wait for: " + esc(x) for x in r["needs"][:3 if compact else 5]]
+    if r["missing"]:
+        L.append("ℹ️ Missing data (counted as neutral): " + esc(", ".join(r["missing"][:4])))
+    label = "Overall confidence" if act in ("BUY", "SELL") else "Setup strength"
+    val = r["confidence"] if act != "NO TRADE" else "-"
+    L += ["", f"<b>{label}: {val}{'/100' if act != 'NO TRADE' else ''}</b> (score {r['score']:+.0f})",
+          "<i>Information only - no orders are placed. Not financial advice; use the stop-loss.</i>"]
+    return "\n".join(L)
+
+
+def card_buttons(base, tf, selected):
+    row = [{"text": ("• " if t == tf else "") + t.upper(), "callback_data": f"cc:card:{base}:{t}"} for t in CARD_TFS]
+    return {"inline_keyboard": [row, [
+        {"text": ("➖ Remove " if selected else "➕ Add ") + base, "callback_data": f"cc:t:{base}:x"},
+        {"text": "📈 Chart", "callback_data": f"an:{base}:{tf}"},
+        {"text": "⚙️ Coins menu", "callback_data": "cc:menu"}]]}
+
+
+def build_coin_card(state, base, tf, track=True):
+    """Gather -> decide -> format. Returns (html, result) or (None, None) if the coin has no data."""
+    c = card_cfg(state)
+    d = card_gather(base, tf)
+    if d.get("an") is None and not d.get("price"):
+        return None, None
+    r = card_decide(d, c["mode"], state.get("account", ACCOUNT_DEFAULT), state.get("risk_pct", RISK_PCT_DEFAULT))
+    html_text = card_html(d, r)
+    if len(html_text) > 3850:
+        html_text = card_html(d, r, compact=True)
+    if track:
+        log_card_signal(state, d, r)
+    return html_text, r
+
+
+# ---------- signal tracking ----------
+
+def log_card_signal(state, d, r):
+    """Store every BUY / SELL plan so real performance can be measured later (/cardstats)."""
+    p = r.get("plan")
+    if r["action"] not in ("BUY", "SELL") or not p:
+        return None
+    c = card_cfg(state)
+    for sg in c["signals"]:
+        if not sg.get("closed") and sg["base"] == d["base"] and sg["tf"] == d["tf"] and sg["action"] == r["action"]:
+            return None                                       # same signal is still open
+    c["seq"] += 1
+    sg = {"id": c["seq"], "base": d["base"], "tf": d["tf"], "action": r["action"], "dir": p["dir"],
+          "entry": p["entry"], "stop": p["stop"], "tp1": p["tp1"], "tp2": p["tp2"], "rr1": p["rr1"], "rr2": p["rr2"],
+          "ts": time.time(), "seen": int(time.time() * 1000), "status": "open", "closed": False,
+          "confidence": r["confidence"], "score": round(r["score"], 1), "mode": r["mode"]}
+    c["signals"].append(sg)
+    return sg
+
+
+def advance_card_signal(sg, rows, now=None):
+    """Move one tracked signal forward with candles [(open_ms, high, low), ...]. Stop is checked before
+    targets inside one candle (the pessimistic choice). TP1 closes half and moves the stop to entry."""
+    dr, risk = sg["dir"], abs(sg["entry"] - sg["stop"])
+    for t_ms, hi, lo in rows:
+        if t_ms <= sg["seen"]:
+            continue
+        sg["seen"] = t_ms
+        worst, best = (lo, hi) if dr > 0 else (hi, lo)
+        hit = (lambda lvl, w=worst: w <= lvl) if dr > 0 else (lambda lvl, w=worst: w >= lvl)
+        reach = (lambda lvl, b=best: b >= lvl) if dr > 0 else (lambda lvl, b=best: b <= lvl)
+        if sg["status"] == "open":
+            if hit(sg["stop"]):
+                return _close_sig(sg, "stop", -1.0)
+            if reach(sg["tp2"]):
+                return _close_sig(sg, "tp2", 0.5 * sg["rr1"] + 0.5 * sg["rr2"])
+            if reach(sg["tp1"]):
+                sg["status"] = "tp1"
+        elif sg["status"] == "tp1":
+            if hit(sg["entry"]):
+                return _close_sig(sg, "tp1_be", 0.5 * sg["rr1"])
+            if reach(sg["tp2"]):
+                return _close_sig(sg, "tp2", 0.5 * sg["rr1"] + 0.5 * sg["rr2"])
+    return sg
+
+
+def _close_sig(sg, outcome, r, now=None):
+    sg.update(closed=True, outcome=outcome, r=round(r, 2), status=outcome, closed_ts=now or time.time())
+    return sg
+
+
+def track_card_signals(state):
+    c = card_cfg(state)
+    for sg in c["signals"]:
+        if sg.get("closed"):
+            continue
+        try:
+            df = cached_klines(sg["tf"], 300, sg["base"] + "USDT", ttl=CARD_KL_TTL)
+            if df is None or df.empty:
+                continue
+            rows = list(zip(df["time"].astype("int64"), df["high"], df["low"]))
+            before = sg["status"]
+            advance_card_signal(sg, rows)
+            if not sg.get("closed") and time.time() - sg["ts"] > CARD_EXPIRE_H.get(sg["tf"], 48) * 3600:
+                last = float(df["close"].iloc[-1])
+                risk = abs(sg["entry"] - sg["stop"])
+                _close_sig(sg, "expired", max(-1.0, min(sg["rr2"], (last - sg["entry"]) * sg["dir"] / risk)))
+            if sg.get("closed") or sg["status"] != before:
+                tg_send_html(card_signal_update_text(sg), None, level="normal")
+        except Exception:
+            traceback.print_exc()
+
+
+def card_signal_update_text(sg):
+    name = f"{sg['base']}/USDT {sg['action']} ({sg['tf']})"
+    if not sg.get("closed"):
+        return f"🎯 <b>{esc(name)}</b>: TP1 reached ({esc(fmt_price(sg['tp1']))}). Half closed, stop moves to entry."
+    icon = "✅" if sg["r"] > 0 else "❌" if sg["r"] < 0 else "➖"
+    why = {"stop": "stop-loss hit", "tp2": "take-profit 2 reached", "tp1_be": "TP1 taken, then stopped at entry",
+           "expired": "expired (closed at market)"}[sg["outcome"]]
+    return f"{icon} <b>{esc(name)}</b> closed: {esc(why)} → <b>{sg['r']:+.2f}R</b>"
+
+
+def card_stats_text(state):
+    c = card_cfg(state)
+    sigs = c["signals"]
+    if not sigs:
+        return "📈 <b>COIN SIGNAL RECORD</b>\nNo BUY/SELL signals yet. Every signal from /card, /cards and the automatic checks is tracked here."
+    def line(lbl, items):
+        closed = [x for x in items if x.get("closed")]
+        wins = [x for x in closed if x["r"] > 0]
+        op = len(items) - len(closed)
+        avg = sum(x["r"] for x in closed) / len(closed) if closed else 0
+        wr = f"{len(wins) / len(closed) * 100:.0f}%" if closed else "-"
+        return f"{esc(lbl)}: {len(items)} signals | {op} open | win rate {wr} | avg {avg:+.2f}R | total {sum(x['r'] for x in closed):+.1f}R"
+    L = ["📈 <b>COIN SIGNAL RECORD</b>", "<i>Paper-tracked: stop first, half off at TP1, stop to entry.</i>", "", line("All coins", sigs), ""]
+    for b in sorted({x["base"] for x in sigs}):
+        L.append(line(b, [x for x in sigs if x["base"] == b]))
+    L += ["", "<b>Latest</b>"]
+    for x in sigs[-5:][::-1]:
+        res = f"{x['r']:+.2f}R ({x['outcome']})" if x.get("closed") else f"open ({x['status']})"
+        L.append(f"#{x['id']} {esc(x['base'])} {x['action']} {esc(x['tf'])} @ {esc(fmt_price(x['entry']))} → {esc(res)}")
+    L += ["", "<i>Judge it after 30+ closed signals; a few trades prove nothing.</i>"]
+    return "\n".join(L)
+
+
+# ---------- menu + commands ----------
+
+def coins_menu_text(state):
+    c = card_cfg(state)
+    every = "off" if not c["every"] else (f"{c['every']} min" if c["every"] < 60 else f"{c['every'] // 60} h")
+    return "\n".join([
+        B("🪙 Select coins to monitor") + f"  ({len(c['coins'])}/{CARD_MAX_COINS} selected)",
+        "Tap a coin to select / unselect it.", "",
+        f"Selected: {esc(', '.join(c['coins']) or 'none')}",
+        f"Timeframe: <b>{esc(c['tf'].upper())}</b> | Auto-check every: <b>{esc(every)}</b> | "
+        f"Mode: <b>{'Spot' if c['mode'] == 'spot' else 'Futures'}</b> | Alerts: <b>{'ON' if c['alerts'] else 'OFF'}</b>", "",
+        "Any coin: <code>/coins add PEPE SUI</code> · <code>/coins remove DOGE</code> · <code>/coins search doge</code>",
+        "Cards: <code>/card SOL 4h</code> (one) · <code>/cards</code> (all selected)",
+        "<i>Alerts arrive only for selected coins, and only when a BUY or SELL setup appears or ends.</i>"])
+
+
+def coins_keyboard(state):
+    c = card_cfg(state)
+    sel = set(c["coins"])
+    coins = list(dict.fromkeys(CARD_POPULAR + c["coins"]))
+    btns = [{"text": ("✅ " if b in sel else "") + f"{b}/USDT", "callback_data": f"cc:t:{b}"} for b in coins]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    rows.append([{"text": ("• " if t == c["tf"] else "") + t.upper(), "callback_data": f"cc:tf:{t}"} for t in CARD_TFS])
+    rows.append([{"text": ("• " if m == c["every"] else "") + ("Off" if m == 0 else f"{m}m" if m < 60 else f"{m // 60}h"),
+                  "callback_data": f"cc:ev:{m}"} for m in CARD_INTERVALS])
+    rows.append([{"text": "📊 Analyse selected", "callback_data": "cc:run"}, {"text": "🧹 Clear", "callback_data": "cc:clear"}])
+    rows.append([{"text": "Mode: " + ("Spot" if c["mode"] == "spot" else "Futures"), "callback_data": "cc:mode"},
+                 {"text": "🔔 Alerts " + ("ON" if c["alerts"] else "OFF"), "callback_data": "cc:al"},
+                 {"text": "📈 Record", "callback_data": "cc:stats"}])
+    return {"inline_keyboard": rows}
+
+
+def show_coins_menu(state, edit_mid=None):
+    text, kb = coins_menu_text(state), coins_keyboard(state)
+    if edit_mid and tg_edit(edit_mid, text, kb):
+        return
+    tg_send_html(text, kb, level="normal")
+
+
+def _card_add(state, bases):
+    c, msgs = card_cfg(state), []
+    tk = tickers()
+    for b in bases:
+        if b in c["coins"]:
+            continue
+        if b not in tk:
+            msgs.append(f"❓ {b} was not found as a USDT pair.")
+        elif len(c["coins"]) >= CARD_MAX_COINS:
+            msgs.append(f"Max {CARD_MAX_COINS} coins - remove one first.")
+            break
+        else:
+            c["coins"].append(b)
+    return msgs
+
+
+def cmd_coins(state, args):
+    c = card_cfg(state)
+    sub = args[0].lower() if args else ""
+    rest = args[1:]
+    msgs = []
+    if not args:
+        show_coins_menu(state)
+        return
+    if sub in ("add", "select"):
+        msgs = _card_add(state, [card_base(a) for a in rest[:CARD_MAX_COINS]])
+    elif sub in ("remove", "rm", "del"):
+        for a in rest:
+            b = card_base(a)
+            if b in c["coins"]:
+                c["coins"].remove(b)
+    elif sub == "clear":
+        c["coins"].clear()
+    elif sub == "search" and rest:
+        q = rest[0].upper().lstrip("$")
+        tk = tickers()
+        hits = sorted((b for b in tk if q in b and b not in EXCLUDE), key=lambda b: -(tk[b].get("quote_vol") or 0))[:8]
+        if not hits:
+            send(f"No USDT pair matches '{q}'.")
+            return
+        kb = {"inline_keyboard": [[{"text": ("✅ " if b in c["coins"] else "➕ ") + f"{b}/USDT", "callback_data": f"cc:t:{b}:s"}
+                                   for b in hits[i:i + 2]] for i in range(0, len(hits), 2)]}
+        tg_send_html(B(f"Search: {q}") + "\nTap to add / remove.", kb, level="normal")
+        return
+    elif sub in ("tf", "timeframe") and rest and rest[0].lower() in CARD_TFS:
+        c["tf"] = rest[0].lower()
+    elif sub in ("every", "interval") and rest:
+        v = rest[0].lower()
+        mins = 0 if v in ("off", "0") else int(v) if v.isdigit() else None
+        if mins is None or (mins and mins < 5):
+            send("Usage: /coins every 15 | 30 | 60 | 240 | off   (minutes, minimum 5)")
+            return
+        c["every"] = mins
+    elif sub == "mode" and rest and rest[0].lower() in ("spot", "futures"):
+        c["mode"] = rest[0].lower()
+    elif sub == "alerts" and rest and rest[0].lower() in ("on", "off"):
+        c["alerts"] = rest[0].lower() == "on"
+    else:
+        send("Usage:\n/coins - menu\n/coins add SOL PEPE | remove SOL | clear | search doge\n/coins tf 4h (15m 1h 4h 1d 1w)\n"
+             "/coins every 60 (minutes, or off)\n/coins mode spot|futures\n/coins alerts on|off")
+        return
+    if msgs:
+        send("\n".join(msgs))
+    show_coins_menu(state)
+
+
+def cmd_card(state, args):
+    c = card_cfg(state)
+    base = card_base(args[0]) if args else (c["coins"][0] if c["coins"] else "BTC")
+    tf = args[1].lower() if len(args) > 1 else None
+    if tf not in CARD_TFS:
+        tf = parse_tf(" ".join(args[1:])) if len(args) > 1 else None
+    if tf not in CARD_TFS:
+        tf = c["tf"]
+    send(f"🔎 Building the {base}/USDT {tf} card (about 10-20 seconds)...", level="low")
+    html_text, _ = build_coin_card(state, base, tf)
+    if not html_text:
+        send(f"Couldn't load data for {base}. It must be a USDT pair on Binance/OKX.")
+        return
+    tg_send_html(localize(html_text, state), card_buttons(base, tf, base in c["coins"]), level="normal")
+
+
+def cmd_cards(state, args):
+    c = card_cfg(state)
+    tf = args[0].lower() if args and args[0].lower() in CARD_TFS else c["tf"]
+    if not c["coins"]:
+        send("No coins selected. Use /coins to pick some, or /coins add SOL ETH.")
+        return
+    send(f"🔎 Analysing {len(c['coins'])} coins on {tf} ({', '.join(c['coins'])})...", level="low")
+    for base in list(c["coins"]):
+        html_text, r = build_coin_card(state, base, tf)
+        if not html_text:
+            send(f"⚠️ {base}: no data (not a Binance/OKX USDT pair?).")
+            continue
+        c["last_action"][base] = r["action"]
+        tg_send_html(localize(html_text, state), card_buttons(base, tf, True), level="normal")
+
+
+def handle_coins_callback(state, cq):
+    c = card_cfg(state)
+    parts = cq.get("data", "").split(":")
+    mid = (cq.get("message") or {}).get("message_id")
+    act = parts[1] if len(parts) > 1 else ""
+    if act == "t" and len(parts) > 2:
+        b = parts[2]
+        if b in c["coins"]:
+            c["coins"].remove(b)
+        else:
+            msgs = _card_add(state, [b])
+            if msgs:
+                send("\n".join(msgs))
+        if len(parts) > 3 and parts[3] == "x":                       # from a card: confirm in a short note
+            send(f"{b} {'added to' if b in c['coins'] else 'removed from'} your coins: {', '.join(c['coins']) or 'none'}", level="low")
+        elif len(parts) > 3 and parts[3] == "s":                     # from search results
+            send(f"Selected coins: {', '.join(c['coins']) or 'none'}", level="low")
+        else:
+            show_coins_menu(state, mid)
+    elif act == "tf" and len(parts) > 2 and parts[2] in CARD_TFS:
+        c["tf"] = parts[2]
+        show_coins_menu(state, mid)
+    elif act == "ev" and len(parts) > 2 and parts[2].isdigit() and int(parts[2]) in CARD_INTERVALS:
+        c["every"] = int(parts[2])
+        show_coins_menu(state, mid)
+    elif act == "mode":
+        c["mode"] = "futures" if c["mode"] == "spot" else "spot"
+        show_coins_menu(state, mid)
+    elif act == "al":
+        c["alerts"] = not c["alerts"]
+        show_coins_menu(state, mid)
+    elif act == "clear":
+        c["coins"].clear()
+        show_coins_menu(state, mid)
+    elif act == "menu":
+        show_coins_menu(state)
+    elif act == "run":
+        cmd_cards(state, [])
+    elif act == "stats":
+        tg_send_html(card_stats_text(state), None, level="normal")
+    elif act == "card" and len(parts) > 3 and parts[3] in CARD_TFS:
+        cmd_card(state, [parts[2], parts[3]])
+
+
+def check_coin_cards(state):
+    """Automatic monitor: every N minutes re-check the selected coins and alert when a BUY / SELL
+    setup appears, or when one that was active is gone. Quiet otherwise."""
+    c = card_cfg(state)
+    if not c["alerts"] or not c["every"] or not c["coins"] or state.get("paused"):
+        return
+    if time.time() - c["last_run"] < c["every"] * 60:
+        return
+    c["last_run"] = time.time()
+    for base in list(c["coins"]):
+        try:
+            html_text, r = build_coin_card(state, base, c["tf"])
+        except Exception:
+            traceback.print_exc()
+            continue
+        if not r:
+            continue
+        prev, c["last_action"][base] = c["last_action"].get(base), r["action"]
+        if r["action"] in ("BUY", "SELL") and prev != r["action"]:
+            tg_send_html("🔔 <b>SIGNAL ALERT</b>\n" + localize(html_text, state), card_buttons(base, c["tf"], True), level="normal")
+        elif prev in ("BUY", "SELL") and r["action"] not in ("BUY", "SELL"):
+            why = "; ".join(r["blockers"] or r["needs"])[:300]
+            tg_send_html(f"⚪ <b>{esc(base)}/USDT</b>: {esc(prev)} setup is no longer valid - now <b>{esc(r['action'])}</b>."
+                         f"\n{esc(why)}", card_buttons(base, c["tf"], True), level="low")
+
+
+# ============================================================
 # TELEGRAM COMMANDS
 # ============================================================
 
@@ -5879,6 +6798,10 @@ HELP_TEXT = (
     "MORNING BRIEF (pinned every morning)\n"
     "/brief - coins with potential to go up + coins at risk of dumping, now\n"
     "/dump - coins at risk of dumping | /morning 07:30 - set time, /morning off\n\n"
+    "COIN CARDS (BUY / SELL / WAIT / NO TRADE with entry, stop, targets, risk)\n"
+    "/coins - pick coins, timeframe, check interval, spot/futures, alerts\n"
+    "/card SOL 4h - full card for one coin | /cards - one card per selected coin\n"
+    "/coins add PEPE | /coins remove SOL | /coins search doge | /cardstats - signal record\n\n"
     "SCANNER & CHARTS\n"
     "/scan - coins where technicals + news line up (best one is pinned with a chart)\n"
     "/analyze SOL 15m - full chart analysis, any coin, 5m 15m 30m 1h 4h 1d 1w\n"
@@ -5991,6 +6914,14 @@ def handle_command(state, cmd, args):
         send(weekly_report_text(state))
     elif cmd == "/watch":
         cmd_watch(state, args)
+    elif cmd == "/coins":
+        cmd_coins(state, args)
+    elif cmd == "/card":
+        cmd_card(state, args)
+    elif cmd == "/cards":
+        cmd_cards(state, args)
+    elif cmd == "/cardstats":
+        tg_send_html(card_stats_text(state), None, level="normal")
     elif cmd in ("/analyze", "/ta"):
         cmd_analyze(state, args)
     elif cmd == "/scan":
@@ -6071,6 +7002,8 @@ def handle_update(state, u):
             handle_trade_callback(state, cq)
         elif data.startswith("set:"):
             handle_setup_callback(state, cq)
+        elif data.startswith("cc:"):
+            handle_coins_callback(state, cq)
         elif data.startswith("why:"):
             cmd_why(state, [data[4:]])
         elif data.startswith("coin:"):
@@ -6377,6 +7310,11 @@ def run_bot(state, deadline, restart=False):
                     check_near_levels(state)
                     flush_digest(state)
                     update_morning_outcomes(state)
+                except Exception:
+                    traceback.print_exc()
+                try:
+                    track_card_signals(state)
+                    check_coin_cards(state)
                 except Exception:
                     traceback.print_exc()
                 t_tick = now
