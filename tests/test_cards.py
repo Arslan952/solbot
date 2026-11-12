@@ -77,7 +77,7 @@ def test_downtrend_spot_sell_has_no_short_plan(monkeypatch):
     assert r["action"] == "SELL"
     assert r["plan"] is None
     html = bot.card_html(d, r)
-    assert "SELL / AVOID" in html and "no short trade" in html.lower()
+    assert "SELL SETUP" in html and "no short trade" in html.lower()
 
 
 def test_downtrend_futures_sell_gets_short_plan(monkeypatch):
@@ -180,11 +180,12 @@ def test_position_size_capped_in_spot():
 
 # ---------- card text ----------
 def test_card_has_all_sections_and_fits_telegram(monkeypatch):
-    patch_market(monkeypatch, drift=0.0025, news=[{"title": "Solana partnership announced with big bank " * 3, "description": ""}])
+    patch_market(monkeypatch, drift=0.0008, seed=15, news=[{"title": "Solana partnership announced with big bank " * 3, "description": ""}])
     d, r = decide()
+    assert r["action"] == "BUY"
     html = bot.card_html(d, r)
     for sec in ("1. Market overview", "2. Trend analysis", "3. Technical indicators", "4. Support and resistance",
-                "5. Trade plan", "6. Risk analysis", "7. News and market conditions", "Decision:", "no orders are placed"):
+                "5. Trade plan", "6. Risk analysis", "7. News and market conditions", "Why:", "Overall confidence", "no orders are placed"):
         assert sec in html
     assert len(html) < 3900
     assert len(re.findall(r"<b>", html)) == len(re.findall(r"</b>", html))
