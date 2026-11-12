@@ -64,6 +64,19 @@ CHART_WITH_REPORT = os.environ.get("CHART_WITH_REPORT", "0") == "1"
 ENABLE_LIQ_WS = os.environ.get("LIQ_WS", "1") == "1"
 
 BTC_SYMBOL = "BTCUSDT"
+FOCUS = {"base": "BTC", "epoch": 0}   # coin the main report / trade signals / live trade follow (/follow SOL)
+
+
+def focus_base():
+    return FOCUS["base"]
+
+
+def focus_symbol():
+    return FOCUS["base"] + "USDT"
+
+
+def focus_name():
+    return COIN_NAMES.get(FOCUS["base"]) or FOCUS["base"]
 REPORT_INTERVAL = 30 * 60
 DATA_POLL_INTERVAL = 60
 SLOW_POLL_INTERVAL = 5 * 60
@@ -447,7 +460,8 @@ OKX_BAR = {"5m": "5m", "15m": "15m", "1h": "1H", "4h": "4H", "1d": "1Dutc", "1w"
 KLINE_COLS = ["time", "open", "high", "low", "close", "volume"]
 
 
-def _klines_binance(interval, limit, symbol=BTC_SYMBOL):
+def _klines_binance(interval, limit, symbol=None):
+    symbol = symbol or focus_symbol()
     for base in BINANCE_SPOT_HOSTS:
         data = http_json(base + "/api/v3/klines",
                          {"symbol": symbol, "interval": interval, "limit": limit})
@@ -456,7 +470,8 @@ def _klines_binance(interval, limit, symbol=BTC_SYMBOL):
     return pd.DataFrame()
 
 
-def _klines_okx(interval, limit, symbol=BTC_SYMBOL):
+def _klines_okx(interval, limit, symbol=None):
+    symbol = symbol or focus_symbol()
     inst = symbol[:-4] + "-USDT" if symbol.endswith("USDT") else "BTC-USDT"
     data = http_json(OKX + "/api/v5/market/candles",
                      {"instId": inst, "bar": OKX_BAR[interval], "limit": min(limit, 300)})
@@ -467,7 +482,8 @@ def _klines_okx(interval, limit, symbol=BTC_SYMBOL):
     return df.iloc[::-1].reset_index(drop=True)
 
 
-def get_klines(interval="5m", limit=500, symbol=BTC_SYMBOL):
+def get_klines(interval="5m", limit=500, symbol=None):
+    symbol = symbol or focus_symbol()
     df = _klines_binance(interval, limit, symbol)
     if df.empty:
         df = _klines_okx(interval, limit, symbol)
@@ -480,14 +496,14 @@ def get_klines(interval="5m", limit=500, symbol=BTC_SYMBOL):
 
 def get_btc_ticker():
     for base in BINANCE_SPOT_HOSTS:
-        d = http_json(base + "/api/v3/ticker/24hr", {"symbol": BTC_SYMBOL})
+        d = http_json(base + "/api/v3/ticker/24hr", {"symbol": focus_symbol()})
         if isinstance(d, dict) and d.get("lastPrice"):
             return {"price": safe_float(d.get("lastPrice")),
                     "change_24h": safe_float(d.get("priceChangePercent")),
                     "high_24h": safe_float(d.get("highPrice")),
                     "low_24h": safe_float(d.get("lowPrice"))}
 
-    d = http_json(OKX + "/api/v5/market/ticker", {"instId": "BTC-USDT"})
+    d = http_json(OKX + "/api/v5/market/ticker", {"instId": f"{focus_base()}-USDT"})
     try:
         t = d["data"][0]
         last = safe_float(t.get("last"))
@@ -498,7 +514,7 @@ def get_btc_ticker():
     except Exception:
         pass
 
-    d = http_json("https://api.coinbase.com/v2/prices/BTC-USD/spot")
+    d = http_json(f"https://api.coinbase.com/v2/prices/{focus_base()}-USD/spot")
     try:
         return {"price": safe_float(d["data"]["amount"]),
                 "change_24h": None, "high_24h": None, "low_24h": None}
@@ -741,17 +757,17 @@ def get_futures_context(state):
            "long_liquidation": None, "short_liquidation": None, "stale": []}
     oi_src = None
 
-    p = http_json(BINANCE_FUTURES + "/fapi/v1/premiumIndex", {"symbol": BTC_SYMBOL})
+    p = http_json(BINANCE_FUTURES + "/fapi/v1/premiumIndex", {"symbol": focus_symbol()})
     if isinstance(p, dict):
         res["funding"] = safe_float(p.get("lastFundingRate"))
-    o = http_json(BINANCE_FUTURES + "/fapi/v1/openInterest", {"symbol": BTC_SYMBOL})
+    o = http_json(BINANCE_FUTURES + "/fapi/v1/openInterest", {"symbol": focus_symbol()})
     if isinstance(o, dict):
         res["open_interest"] = safe_float(o.get("openInterest"))
         if res["open_interest"] is not None:
             oi_src = "binance"
 
     if res["funding"] is None or res["open_interest"] is None:
-        b = http_json(BYBIT + "/v5/market/tickers", {"category": "linear", "symbol": BTC_SYMBOL})
+        b = http_json(BYBIT + "/v5/market/tickers", {"category": "linear", "symbol": focus_symbol()})
         try:
             item = b["result"]["list"][0]
             if res["funding"] is None:
@@ -764,14 +780,14 @@ def get_futures_context(state):
             pass
 
     if res["funding"] is None:
-        f = http_json(OKX + "/api/v5/public/funding-rate", {"instId": "BTC-USDT-SWAP"})
+        f = http_json(OKX + "/api/v5/public/funding-rate", {"instId": f"{focus_base()}-USDT-SWAP"})
         try:
             res["funding"] = safe_float(f["data"][0].get("fundingRate"))
         except Exception:
             pass
     if res["open_interest"] is None:
         oi = http_json(OKX + "/api/v5/public/open-interest",
-                       {"instType": "SWAP", "instId": "BTC-USDT-SWAP"})
+                       {"instType": "SWAP", "instId": f"{focus_base()}-USDT-SWAP"})
         try:
             res["open_interest"] = safe_float(oi["data"][0].get("oiCcy"))
             if res["open_interest"] is not None:
@@ -792,9 +808,12 @@ def get_futures_context(state):
             res["oi_window_min"] = int((now - ref[0]) / 60)
         res["oi_source"] = oi_src
 
-    lng, sht = liq_from_ws()
-    if lng is None:
-        lng, sht = _okx_liquidations()
+    if focus_base() == "BTC":
+        lng, sht = liq_from_ws()
+        if lng is None:
+            lng, sht = _okx_liquidations()
+    else:
+        lng = sht = None          # the liquidation feed is BTC-only: never show BTC numbers for another coin
     res["long_liquidation"], res["short_liquidation"] = lng, sht
 
     # Short-lived fallback cache: reuse a value only if it is < STALE_MIN old, and say so.
@@ -812,7 +831,7 @@ def get_crowd_context():
     out = {"taker_buy_ratio": None, "ls_ratio": None}
 
     d = http_json(OKX + "/api/v5/rubik/stat/taker-volume",
-                  {"ccy": "BTC", "instType": "CONTRACTS", "period": "5m"})
+                  {"ccy": focus_base(), "instType": "CONTRACTS", "period": "5m"})
     try:
         rows = sorted(d["data"], key=lambda r: float(r[0]), reverse=True)[:6]  # newest first
         sell = sum(float(r[1]) for r in rows)
@@ -823,7 +842,7 @@ def get_crowd_context():
         pass
 
     d = http_json(OKX + "/api/v5/rubik/stat/contracts/long-short-account-ratio",
-                  {"ccy": "BTC", "period": "5m"})
+                  {"ccy": focus_base(), "period": "5m"})
     try:
         rows = sorted(d["data"], key=lambda r: float(r[0]), reverse=True)
         out["ls_ratio"] = float(rows[0][1])
@@ -928,9 +947,21 @@ def news_impact(item):
     return impact, direction
 
 
+def news_feeds():
+    """Bitcoin feeds for BTC; for any other followed coin: that coin + crypto market + macro."""
+    base = focus_base()
+    if base == "BTC":
+        return NEWS_FEEDS
+    tail = "&hl=en-US&gl=US&ceid=US%3Aen"
+    name = quote(focus_name())
+    return {base: f"https://news.google.com/rss/search?q={name}%20crypto%20when%3A6h{tail}",
+            "Crypto": f"https://news.google.com/rss/search?q=crypto%20market%20when%3A2h{tail}",
+            "Macro": f"https://news.google.com/rss/search?q=Federal%20Reserve%20CPI%20jobs%20Treasury%20crypto%20when%3A6h{tail}"}
+
+
 def fetch_news():
     all_items = []
-    for category, url in NEWS_FEEDS.items():
+    for category, url in news_feeds().items():
         all_items.extend(parse_rss(url, category))
 
     unique = {news_key(i): i for i in all_items}
@@ -979,8 +1010,8 @@ def ai_news_summary(news):
         "You are a calm crypto market analyst writing for beginners. "
         "Plain English, no hype, no financial advice.",
         f"Recent headlines:\n{lines}\n\n"
-        "Write exactly: two short bullets with what matters most for Bitcoin, "
-        "then one line starting 'BTC impact:' with Bullish, Bearish or Neutral and a reason. "
+        f"Write exactly: two short bullets with what matters most for {focus_name()}, "
+        f"then one line starting '{focus_base()} impact:' with Bullish, Bearish or Neutral and a reason. "
         "Max 70 words total.",
         max_tokens=250,
     )
@@ -990,11 +1021,11 @@ def ai_news_summary(news):
 
 def claude_classify(item):
     text = claude_call(
-        "You filter breaking news for a Bitcoin trader. Reply with JSON only.",
+        f"You filter breaking news for a {focus_name()} trader. Reply with JSON only.",
         f"Headline: {item['title']}\nSource: {item['source']}\n\n"
         'Reply: {"important": true/false, "direction": "bullish|bearish|neutral", '
-        '"summary": "one plain-English sentence on why it matters for BTC"}. '
-        "important=true only if it could move BTC within hours.",
+        '"summary": "one plain-English sentence on why it matters for ' + focus_base() + '"}. '
+        "important=true only if it could move " + focus_base() + " within hours.",
         max_tokens=150,
     )
     if not text:
@@ -1032,7 +1063,7 @@ def check_breaking_news(state, news):
             "📰 BREAKING NEWS", "━━━━━━━━━━━━━━━━━━━━",
             f"{icon} {n['title']}",
             f"Source: {n['source']}",
-            f"Likely BTC effect: {direction}",
+            f"Likely {focus_base()} effect: {direction}",
         ] + ([f"Why: {why}"] if why else []) + [
             "", "News can reverse fast. Do not chase the first spike.",
         ]))
@@ -1173,9 +1204,9 @@ def event_direction(event):
     if any(k in name for k in ["cpi", "pce", "ppi", "inflation", "consumer price",
                                "producer price", "price index"]):
         if surprise > 0:
-            return "BEARISH", "Inflation hotter than expected -> rate/yield pressure -> usually bad for BTC."
+            return "BEARISH", "Inflation hotter than expected -> rate/yield pressure -> usually bad for crypto."
         if surprise < 0:
-            return "BULLISH", "Inflation cooler than expected -> less rate pressure -> usually good for BTC."
+            return "BULLISH", "Inflation cooler than expected -> less rate pressure -> usually good for crypto."
         return "NEUTRAL", "Inflation matched expectations."
 
     if any(k in name for k in ["fomc", "fed rate", "interest rate decision", "fed decision"]):
@@ -1281,7 +1312,7 @@ def oi_words(futures):
     if oi is None:
         return "Open interest: could not be fetched from any exchange this cycle"
     stale = " (stale)" if "open_interest" in (futures.get("stale") or []) else ""
-    base = f"Open interest: {oi:,.0f} BTC{stale}"
+    base = f"Open interest: {oi:,.0f} {focus_base()}{stale}"
     if ch is None:
         return base + " (change shows after ~5 min of history from the same exchange)"
     meaning = ("lots of NEW money entering -> bigger move likely" if ch > 2 else
@@ -1341,10 +1372,10 @@ def cross_line(name, a, good_if_up, label):
     else:
         thr = 0.15 if name == "DXY" else 0.3
         if abs(ch) < thr:
-            meaning = "flat - no pressure on BTC"
+            meaning = f"flat - no pressure on {focus_base()}"
         else:
             helps = (ch > 0) == bool(good_if_up)
-            meaning = "good for BTC ✅" if helps else "bad for BTC ❌"
+            meaning = f"good for {focus_base()} ✅" if helps else f"bad for {focus_base()} ❌"
     return f"{label}: {price_txt} ({ch:+.2f}%) -> {meaning}{stale}"
 
 
@@ -1442,9 +1473,9 @@ def calculate_bias(tech, futures, cross, news, fng=None, crowd=None):
 
     if dxy.get("change") is not None:
         if dxy["change"] > 0.4:
-            score -= 0.75; reasons.append("US Dollar getting stronger (bad for BTC)")
+            score -= 0.75; reasons.append(f"US Dollar getting stronger (bad for {focus_base()})")
         elif dxy["change"] < -0.4:
-            score += 0.75; reasons.append("US Dollar getting weaker (good for BTC)")
+            score += 0.75; reasons.append(f"US Dollar getting weaker (good for {focus_base()})")
     if nq.get("change") is not None:
         if nq["change"] > 0.5:
             score += 0.5; reasons.append("Stocks (Nasdaq) are rising - risk-on")
@@ -1452,9 +1483,9 @@ def calculate_bias(tech, futures, cross, news, fng=None, crowd=None):
             score -= 0.5; reasons.append("Stocks (Nasdaq) are falling - risk-off")
     if y10.get("change") is not None:
         if y10["change"] > 1.0:
-            score -= 0.5; reasons.append("Bond yields rising (bad for BTC)")
+            score -= 0.5; reasons.append(f"Bond yields rising (bad for {focus_base()})")
         elif y10["change"] < -1.0:
-            score += 0.5; reasons.append("Bond yields falling (good for BTC)")
+            score += 0.5; reasons.append(f"Bond yields falling (good for {focus_base()})")
     if vix.get("change") is not None:
         if vix["change"] > 5:
             score -= 0.75; reasons.append("Fear index (VIX) jumping")
@@ -1631,7 +1662,7 @@ def plan_text_lines(plan, bias):
             f"💰 Position size: risk ${plan['risk_usd']:,.2f} "
             f"({plan['risk_usd'] / plan['account'] * 100:.2f}% of ${plan['account']:,.0f})"
             + (f"  ({plan['vol_note']})" if plan.get("vol_note") else ""),
-            f"-> size ~{plan['size_btc']:.4f} BTC (~${plan['notional']:,.0f} position, ≈{lev:.1f}x leverage)",
+            f"-> size ~{plan['size_btc']:.4f} {focus_base()} (~${plan['notional']:,.0f} position, ≈{lev:.1f}x leverage)",
         ]
         if plan.get("capped"):
             lines.append(f"⚠️ Size was capped at {max_lev_now():.1f}x leverage, so your real risk is "
@@ -1642,8 +1673,8 @@ def plan_text_lines(plan, bias):
     else:
         lines += [
             "",
-            f"👀 Watch: LONG only if BTC holds above {fmt_price(plan.get('trigger_long'))}",
-            f"          SHORT only if BTC drops below {fmt_price(plan.get('trigger_short'))}",
+            f"👀 Watch: LONG only if {focus_base()} holds above {fmt_price(plan.get('trigger_long'))}",
+            f"          SHORT only if {focus_base()} drops below {fmt_price(plan.get('trigger_short'))}",
         ]
     return lines
 
@@ -1654,7 +1685,7 @@ def plan_text_lines(plan, bias):
 
 def new_trade(plan, ts):
     return {
-        "id": str(int(ts)), "action": plan["action"], "created": ts,
+        "id": str(int(ts)), "action": plan["action"], "coin": focus_base(), "created": ts,
         "expires": ts + EXPIRE_MIN * 60, "status": "PENDING",
         "entry": plan["entry"], "stop": plan["stop"],
         "tp1": plan["tp1"], "tp2": plan["tp2"], "risk": plan["risk"],
@@ -2030,7 +2061,7 @@ def make_chart(trade=None, tf="15m"):
         hline(src["tp1"], "#16a34a", "TP1", "--")
         hline(src["tp2"], "#15803d", "TP2", "--")
 
-    ax.set_title(f"BTC/USDT {tf} - last 24h", fontsize=11)
+    ax.set_title(f"{focus_base()}/USDT {tf} - last 24h", fontsize=11)
     ax.legend(loc="upper left", fontsize=8)
     ax.grid(alpha=0.2)
     ax.set_xticks([])
@@ -2064,7 +2095,7 @@ def event_alert_message(event, minutes_to_event):
     for label, key in (("Expected", "forecast"), ("Previous", "previous"), ("Actual", "actual")):
         if event.get(key) is not None:
             lines.append(f"{label}: {event[key]}")
-    lines += ["", f"BTC reading: {direction}", explanation]
+    lines += ["", f"{focus_base()} reading: {direction}", explanation]
     rt = reaction_text(CTX.get("state") or {}, event["name"])
     if rt:
         lines.append(rt)
@@ -2113,9 +2144,9 @@ def check_market_open_alerts(state):
                     continue
                 timing = (f"{name} stock market is OPEN now." if window == 0
                           else f"{name} stock market opens in ~{window} minutes.")
-                extra = ("\n\n🔥 The US open is usually the most volatile time for BTC.\n"
+                extra = ("\n\n🔥 The US open is usually the most volatile time for crypto.\n"
                          "Expect faster moves. Use stop-losses." if name == "New York" else
-                         "\n\nBTC trades 24/7, but this session can change liquidity and volatility.")
+                         "\n\nCrypto trades 24/7, but this session can change liquidity and volatility.")
                 send(f"🌍 MARKET SESSION\n━━━━━━━━━━━━━━━━━━━━\n{timing}{extra}\n\n"
                      "This is a volatility heads-up, not a direction signal.")
                 state["market_open_alerts"][key] = time.time()
@@ -2216,7 +2247,7 @@ def build_report(state):
     price = ticker.get("price") or levels.get("price")
     t = state.get("active_trade")
 
-    head = ["₿ BTC UPDATE", utc_text(),
+    head = [f"₿ {focus_base()} UPDATE", utc_text(),
             f"Price: {fmt_price(price)}  |  24h: {fmt_pct(ticker.get('change_24h'))}",
             "━━━━━━━━━━━━━━━━━━━━", "", "🎯 WHAT TO DO NOW"]
     if t:
@@ -2305,7 +2336,7 @@ def send_market_report(state):
     if CHART_WITH_REPORT:
         png = make_chart()
         if png:
-            send_photo(png, "BTC 15m chart")
+            send_photo(png, f"{focus_base()} 15m chart")
 
 
 # ============================================================
@@ -2352,6 +2383,7 @@ BOT_COMMANDS = [
     ("quiet", "Quiet hours /quiet 00:00-07:00"), ("lang", "Language en|simple|ur"),
     ("coins", "Choose coins to monitor /coins add PEPE"), ("card", "Full BUY/SELL/WAIT card /card SOL 4h"),
     ("cards", "Cards for all selected coins"), ("cardstats", "Record of coin card signals"),
+    ("follow", "Main report & signals follow a coin /follow SOL"),
     ("help", "All commands"),
 ]
 
@@ -2996,7 +3028,7 @@ TF_SECS = {"15m": 900, "1h": 3600, "4h": 14400}
 
 
 def _price_of(base):
-    if base == "BTC" and (CTX.get("ticker") or {}).get("price"):
+    if base == focus_base() and (CTX.get("ticker") or {}).get("price"):
         return CTX["ticker"]["price"]
     return (tickers().get(base) or {}).get("price")
 
@@ -3033,14 +3065,14 @@ def cmd_alert(state, args):
         if tf not in TF_SECS or direction not in ("above", "below") or not level:
             send("Usage: /alert close 1h above 68000   (timeframes: 15m, 1h, 4h)")
             return
-        alerts.append({"id": state["alert_seq"], "kind": "close", "sym": "BTC", "tf": tf,
+        alerts.append({"id": state["alert_seq"], "kind": "close", "sym": focus_base(), "tf": tf,
                        "dir": direction, "level": level, "created": time.time()})
-        send(f"✅ Alert #{state['alert_seq']}: I'll tell you when a BTC {tf} candle CLOSES {direction} {level:,.0f}.")
+        send(f"✅ Alert #{state['alert_seq']}: I'll tell you when a {focus_base()} {tf} candle CLOSES {direction} {level:,.0f}.")
         return
-    base, level = ("BTC", safe_float(args[0])) if len(args) == 1 else (args[0].upper().lstrip("$"), safe_float(args[1]))
+    base, level = (focus_base(), safe_float(args[0])) if len(args) == 1 else (args[0].upper().lstrip("$"), safe_float(args[1]))
     price = _price_of(base)
     if not level or price is None:
-        send("Usage: /alert 70000   or   /alert SOL 200   (coin must be a USDT pair)")
+        send("Usage: /alert 70000 (for the followed coin)   or   /alert SOL 200   (coin must be a USDT pair)")
         return
     direction = "above" if level > price else "below"
     alerts.append({"id": state["alert_seq"], "kind": "price", "sym": base, "dir": direction,
@@ -3062,14 +3094,14 @@ def check_price_alerts(state):
                 hit = p >= a["level"] if a["dir"] == "above" else p <= a["level"]
                 info = f"{a['sym']} is {p:,.4g} (target {a['dir']} {a['level']:,.4g})"
         else:
-            df = CANDLES.get(a["tf"])
+            df = CANDLES.get(a["tf"]) if a.get("sym", "BTC") == focus_base() else None
             if df is not None and len(df) > 5:
                 row = df.iloc[-2]
                 closed_at = float(row["time"]) / 1000 + TF_SECS[a["tf"]]
                 if closed_at > a["created"]:
                     c = float(row["close"])
                     hit = c > a["level"] if a["dir"] == "above" else c < a["level"]
-                    info = f"BTC {a['tf']} candle closed at {c:,.0f} ({a['dir']} {a['level']:,.0f})"
+                    info = f"{a.get('sym', 'BTC')} {a['tf']} candle closed at {c:,.0f} ({a['dir']} {a['level']:,.0f})"
         if hit:
             send(f"🔔 ALERT #{a['id']}\n{info}", level="critical")
         else:
@@ -3255,7 +3287,7 @@ def _r_now(t, price):
 
 
 def live_trade_text(t, price, final=False):
-    L = [B(f"📌 {'CLOSED' if final else 'LIVE'} TRADE - {t['action']} BTC")]
+    L = [B(f"📌 {'CLOSED' if final else 'LIVE'} TRADE - {t['action']} {t.get('coin') or focus_base()}")]
     if final:
         r = t.get("result_r")
         L.append(f"Result: {esc(t.get('outcome') or 'ended')}" + (f" | {r:+.2f}R" if r is not None else ""))
@@ -3324,7 +3356,7 @@ def build_daily_plan(state):
     price = (c.get("ticker") or {}).get("price") or levels.get("price")
     lt = local_now(state)
     L = [B(f"🗓 DAILY PLAN - {lt.strftime('%a %d %b')}"), "━━━━━━━━━━━━━━━━━━━━",
-         f"BTC {esc(fmt_price(price))} | mood {esc(bias['bias'])} {strength_stars(bias['score'])}",
+         f"{focus_base()} {esc(fmt_price(price))} | mood {esc(bias['bias'])} {strength_stars(bias['score'])}",
          f"Signal now: <b>{esc(plan['action'])}</b>"
          + (f" - {esc(plan['why'][0])}" if plan.get("why") else "")]
     if levels:
@@ -3554,7 +3586,7 @@ def market_context_text(state):
     kl, plan, bias = c.get("keylevels") or {}, c["plan"], c["bias"]
     price = (c.get("ticker") or {}).get("price")
     lines = [f"Time: {utc_text()} (weekend={is_weekend()})",
-             f"BTC price {price}, 24h change {(c.get('ticker') or {}).get('change_24h')}%",
+             f"{focus_base()} price {price}, 24h change {(c.get('ticker') or {}).get('change_24h')}%",
              f"Mood {bias['bias']} score {bias['score']:+.1f}; bot signal {plan['action']}; reasons: "
              + "; ".join(bias.get("reasons") or [])[:300]]
     for tf in ("1w", "1d", "4h", "1h", "15m"):
@@ -4665,7 +4697,7 @@ def _levels_for(base):
 
 def check_near_levels(state):
     """'Approaching resistance/support' heads-up for BTC and watchlist coins (within 0.5%)."""
-    coins = ["BTC"] + [c for c in (state.get("watchlist") or []) if c != "BTC"]
+    coins = [focus_base()] + [c for c in (state.get("watchlist") or []) if c != focus_base()]
     cd, now = state.setdefault("pump_cooldown", {}), time.time()
     for b in coins[:8]:
         px = _price_of(b)
@@ -5011,7 +5043,7 @@ def build_morning_brief(state, ups, downs, danger):
     lt = local_now(state)
     for detail_n in (3, 2, 1):
         L = [B(f"☀️ MORNING BRIEF — {lt.strftime('%a %d %b')}"), esc(utc_text()), "━━━━━━━━━━━━━━━━━━━━",
-             f"BTC {esc(fmt_price(price))} ({esc(fmt_pct(ticker.get('change_24h')))}) | mood <b>{esc(bias['bias'])}</b> "
+             f"{focus_base()} {esc(fmt_price(price))} ({esc(fmt_pct(ticker.get('change_24h')))}) | mood <b>{esc(bias['bias'])}</b> "
              f"{strength_stars(bias['score'])} | signal: <b>{esc(plan['action'])}</b>",
              f"Trend: 1d {arrow((tech.get('1d') or {}).get('trend'))} 4h {arrow((tech.get('4h') or {}).get('trend'))} "
              f"1h {arrow((tech.get('1h') or {}).get('trend'))}"]
@@ -5293,7 +5325,7 @@ def build_card(state, update_delta=False):
     price = ticker.get("price") or levels.get("price")
     t = state.get("active_trade")
 
-    L = [B(f"₿ BTC {fmt_price(price)}") + f"  (24h {esc(fmt_pct(ticker.get('change_24h')))})",
+    L = [B(f"₿ {focus_base()} {fmt_price(price)}") + f"  (24h {esc(fmt_pct(ticker.get('change_24h')))})",
          esc(utc_text()), "━━━━━━━━━━━━━━━━━━━━"]
 
     # ---- verdict
@@ -5310,7 +5342,7 @@ def build_card(state, update_delta=False):
         L.append(f"Order: {'BUY' if plan['action'] == 'LONG' else 'SELL'} LIMIT at {esc(fmt_price(plan['entry']))}")
         L.append(f"Stop: {esc(fmt_price(plan['stop']))} | TP1: {esc(fmt_price(plan['tp1']))} | "
                  f"TP2: {esc(fmt_price(plan['tp2']))}")
-        L.append(f"Risk ${plan['risk_usd']:,.2f} → size ≈ {plan['size_btc']:.4f} BTC "
+        L.append(f"Risk ${plan['risk_usd']:,.2f} → size ≈ {plan['size_btc']:.4f} {focus_base()} "
                  f"(≈ ${plan['notional']:,.0f}, ~{plan.get('leverage', 0):.1f}x leverage)")
         if plan.get("capped"):
             L.append(f"⚠️ Size capped at {max_lev_now():.1f}x leverage (stop is wide for your account).")
@@ -5738,7 +5770,7 @@ def reaction_text(state, name):
     lst = ((state or {}).get("event_reactions") or {}).get(name) or []
     if not lst:
         return None
-    return (f"BTC after the last {min(3, len(lst))} '{name}': "
+    return (f"{focus_base()} after the last {min(3, len(lst))} '{name}': "
             + ", ".join(f"{x['pct']:+.1f}%" for x in lst[-3:]) + " (30 min later)")
 
 
@@ -5781,7 +5813,9 @@ def get_global_market():
 
 
 def get_options_context():
-    """Deribit public data: put/call ratio and implied volatility near the money."""
+    """Deribit public data: put/call ratio and implied volatility near the money (BTC options only)."""
+    if focus_base() != "BTC":
+        return None
     if time.time() - OPT_CACHE["ts"] < 600 and OPT_CACHE["data"]:
         return OPT_CACHE["data"]
     d = http_json(DERIBIT + "/api/v2/public/get_book_summary_by_currency",
@@ -6465,7 +6499,8 @@ def card_buttons(base, tf, selected):
     return {"inline_keyboard": [row, [
         {"text": ("➖ Remove " if selected else "➕ Add ") + base, "callback_data": f"cc:t:{base}:x"},
         {"text": "📈 Chart", "callback_data": f"an:{base}:{tf}"},
-        {"text": "⚙️ Coins menu", "callback_data": "cc:menu"}]]}
+        {"text": "⚙️ Coins menu", "callback_data": "cc:menu"}],
+        [{"text": f"🎯 Follow {base} (main report & signals)", "callback_data": f"cc:follow:{base}"}]]}
 
 
 def build_coin_card(state, base, tf, track=True):
@@ -6598,6 +6633,7 @@ def coins_menu_text(state):
         B("Select coins to monitor") + f"\n{len(c['coins'])} selected (max {CARD_MAX_COINS})",
         "Tap a coin to select / unselect it.", "",
         f"Selected: {esc(', '.join(c['coins']) or 'none')}",
+        f"Main report & signals follow: <b>{esc(focus_base())}</b>  (change: /follow SOL)",
         f"Timeframe: <b>{esc(c['tf'].upper())}</b> | Auto-check every: <b>{esc(every)}</b> | "
         f"Mode: <b>{'Spot' if c['mode'] == 'spot' else 'Futures'}</b> | Alerts: <b>{'ON' if c['alerts'] else 'OFF'}</b>", "",
         "Any coin: <code>/coins add PEPE SUI</code> · <code>/coins remove DOGE</code> · <code>/coins search doge</code>",
@@ -6727,6 +6763,46 @@ def cmd_cards(state, args):
         tg_send_html(localize(html_text, state), card_buttons(base, tf, True), level="normal")
 
 
+def set_focus(state, raw):
+    """Make the main report, trade signals, live trade and price alerts follow another coin.
+    Refused while a trade is open, because its prices belong to the old coin."""
+    base = card_base(raw)
+    if base == focus_base():
+        return True, f"Already following {base}."
+    if base not in tickers():
+        return False, f"❓ {base} was not found as a USDT pair on Binance/OKX."
+    if state.get("active_trade"):
+        return False, (f"⛔ A {focus_base()} trade is still open. Finish it first (see /trade), then switch to {base}.")
+    FOCUS["base"] = base
+    FOCUS["epoch"] += 1
+    state["focus"] = base
+    for cache in (TECH_CACHE, CANDLES, TF_TS, FUT_CACHE):
+        cache.clear()
+    for k in ("ticker", "tech", "futures", "bias", "levels", "plan", "options", "keylevels", "news"):
+        CTX.pop(k, None)
+    OPT_CACHE.update(ts=0, data=None)
+    NEWS_AI_CACHE.update(sig=None, text=None)
+    state.update(oi_history=[], price_hist=[], sig_streak={"action": None, "count": 0}, cooldown_until=0, last_report=0)
+    note = "" if base == "BTC" else (" Note: liquidation and options data exist for BTC only, so those lines are hidden. "
+                                     "Funding / open interest show only if the coin has a perpetual market.")
+    return True, (f"✅ Now following {base}. The report, trade signals, live trade and price alerts use {base}. "
+                  f"A fresh report arrives within a minute.{note}")
+
+
+def cmd_follow(state, args):
+    if args:
+        ok, msg = set_focus(state, args[0])
+        send(msg)
+        return
+    c = card_cfg(state)
+    coins = list(dict.fromkeys([focus_base()] + c["coins"] + ["BTC"]))
+    kb = {"inline_keyboard": [[{"text": ("• " if b == focus_base() else "") + b, "callback_data": f"cc:follow:{b}"}
+                               for b in coins[i:i + 3]] for i in range(0, len(coins), 3)]}
+    tg_send_html(f"🎯 The main report, trade signals, live trade and price alerts follow: <b>{esc(focus_base())}</b>\n"
+                 "Tap a coin to switch, or type <code>/follow SOL</code>.\n"
+                 "<i>Cards (/card, /cards) always work for any coin, whatever you follow.</i>", kb, level="normal")
+
+
 def handle_coins_callback(state, cq):
     c = card_cfg(state)
     parts = cq.get("data", "").split(":")
@@ -6761,6 +6837,9 @@ def handle_coins_callback(state, cq):
     elif act == "clear":
         c["coins"].clear()
         show_coins_menu(state, mid)
+    elif act == "follow" and len(parts) > 2:
+        ok, msg = set_focus(state, parts[2])
+        send(msg)
     elif act == "menu":
         show_coins_menu(state)
     elif act == "copy":
@@ -6814,6 +6893,7 @@ HELP_TEXT = (
     "COIN CARDS (BUY / SELL / WAIT / NO TRADE with entry, stop, targets, risk)\n"
     "/coins - pick coins, timeframe, check interval, spot/futures, alerts\n"
     "/card SOL 4h - full card for one coin | /cards - one card per selected coin\n"
+    "/follow SOL - the main report, trade signals, live trade and price alerts follow SOL (not only BTC)\n"
     "/coins add PEPE | /coins remove SOL | /coins search doge | /cardstats - signal record\n\n"
     "SCANNER & CHARTS\n"
     "/scan - coins where technicals + news line up (best one is pinned with a chart)\n"
@@ -6933,6 +7013,8 @@ def handle_command(state, cmd, args):
         cmd_card(state, args)
     elif cmd == "/cards":
         cmd_cards(state, args)
+    elif cmd in ("/follow", "/focus"):
+        cmd_follow(state, args)
     elif cmd == "/cardstats":
         tg_send_html(card_stats_text(state), None, level="normal")
     elif cmd in ("/analyze", "/ta"):
@@ -6976,7 +7058,7 @@ def handle_command(state, cmd, args):
     elif cmd == "/chart":
         png = make_chart()
         if png:
-            send_photo(png, "BTC 15m chart")
+            send_photo(png, f"{focus_base()} 15m chart")
         else:
             send("Chart not available (needs matplotlib and some candle data).")
     elif cmd == "/account":
@@ -7254,7 +7336,7 @@ def send_startup(restart=False):
         send("🔄 Bot restarted after an error and is running again. Open trades are restored.")
         return
     send(
-        "₿ BTC MARKET BOT v3.5 STARTED\n"
+        f"₿ {focus_base()} MARKET BOT v3.6 STARTED\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "• A clear action every 30 min: LONG / SHORT / WAIT\n"
         "• Headline card + tabs: Trend, Futures, Macro, News, Levels, Stats\n"
@@ -7283,10 +7365,17 @@ def run_bot(state, deadline, restart=False):
     fng, crowd, glob, opts = None, {}, None, None
     errors = 0
     CTX["state"] = state
+    FOCUS["base"] = state.get("focus") or "BTC"
+    seen_epoch = FOCUS["epoch"]
 
     while time.time() < deadline and not STOP_FLAG["stop"]:
         try:
             now = time.time()
+            if FOCUS["epoch"] != seen_epoch:       # /follow switched coin: drop every old-coin value, reload now
+                seen_epoch = FOCUS["epoch"]
+                tech, futures, ticker, opts, crowd = {}, {}, {}, None, {}
+                news = []
+                t_fast = t_slow = 0
 
             if now - t_fast >= DATA_POLL_INTERVAL:
                 tech = build_technical_context()
