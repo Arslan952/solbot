@@ -6344,109 +6344,119 @@ def _liq_label(qv, spread):
     return lab
 
 
-ACTION_HEAD = {"BUY": "🟢 BUY SETUP", "SELL": "🔴 SELL SETUP", "WAIT": "🟡 WAIT", "NO TRADE": "⛔ NO TRADE"}
+ACTION_HEAD = {"BUY": "BUY SETUP", "SELL": "SELL SETUP", "WAIT": "WAIT", "NO TRADE": "NO TRADE"}
 
 
 def card_html(d, r, compact=False):
+    """The card, in the exact section order of the spec: header, 1 Market overview, 2 Trend analysis,
+    3 Technical indicators, 4 Support and resistance, 5 Trade plan, 6 Risk analysis,
+    7 News and market conditions, then the decision with its reasons and the overall confidence."""
     base, tf, mode = d["base"], d["tf"], r["mode"]
     an, tk, price = d.get("an"), d.get("tk") or {}, d.get("price")
-    act = r["action"]
-    head = ACTION_HEAD[act]
-    if act == "SELL" and mode == "spot":
-        head = "🔴 SELL / AVOID (spot: exit or stay out)"
-    L = [f"<b>{esc(base)}/USDT</b> · <b>{esc(head)}</b>",
-         f"<b>{esc(fmt_price(price))}</b>  {esc(fmt_pct(tk.get('change_24h')))} · 24h  |  {esc(tf.upper())} analysis · "
-         f"{'Spot' if mode == 'spot' else 'Futures'} mode", ""]
+    act, p = r["action"], r["plan"]
+    L = [f"<b>{esc(base)}/USDT</b>", f"<b>{ACTION_HEAD[act]}</b>", "",
+         f"<b>{esc(fmt_price(price))}</b>",
+         f"{esc(fmt_pct(tk.get('change_24h')))} · 24-hour change  ({esc(tf.upper())} analysis, "
+         f"{'Spot' if mode == 'spot' else 'Futures'} mode)", ""]
 
-    L.append(B("1. Market overview"))
-    L.append(f"24h high / low: {esc(fmt_price(tk.get('high')))} / {esc(fmt_price(tk.get('low')))}")
     spread_txt = "n/a" if d.get("spread") is None else format(d["spread"], ".3f") + "%"
-    L.append(f"Volume: {esc(_fmt_usd(tk.get('quote_vol')))} | Spread: {esc(spread_txt)} | Liquidity: "
-             f"{esc(_liq_label(tk.get('quote_vol'), d.get('spread')))}")
+    L += [B("1. Market overview"),
+          f"- Current price and 24h change: {esc(fmt_price(price))} ({esc(fmt_pct(tk.get('change_24h')))})",
+          f"- 24h high / low: {esc(fmt_price(tk.get('high')))} / {esc(fmt_price(tk.get('low')))}",
+          f"- Trading volume: {esc(_fmt_usd(tk.get('quote_vol')))}",
+          f"- Liquidity and spread: {esc(_liq_label(tk.get('quote_vol'), d.get('spread')))}, spread {esc(spread_txt)}", ""]
 
-    L += ["", B("2. Trend analysis")]
-    L.append(" · ".join(f"{t.upper()} {arrow(d['trends'][t]) if d['trends'].get(t) else '❔'} "
-                         f"{esc(CARD_TREND_NAME.get(d['trends'].get(t), 'n/a'))}" for t in CARD_TREND_ROW))
+    rows = ["Timeframe  Trend"] + [f"{t.upper():<11}{CARD_TREND_NAME.get(d['trends'].get(t), 'n/a')}" for t in CARD_TREND_ROW]
+    L += [B("2. Trend analysis"), "<pre>" + esc("\n".join(rows)) + "</pre>", ""]
 
-    L += ["", B(f"3. Technical indicators ({tf.upper()})")]
+    L.append(B("3. Technical indicators"))
     if an:
         def rel(val):
             return "n/a" if not val else f"{fmt_price(val)} ({'above' if price > val else 'below'})"
-        L.append(f"RSI: {_num(d.get('rsi'))} | ADX: {_num(d.get('adx'))} | Volume: "
-                 f"{'n/a' if d.get('vol_ratio') is None else format(d['vol_ratio'], '.1f') + 'x avg'}")
-        L.append(f"EMA 20: {esc(rel(d.get('ema20')))}")
-        L.append(f"EMA 50: {esc(rel(d.get('ema50')))} | EMA 200: {esc(rel(d.get('ema200')))}")
-        L.append(f"MACD: {esc(d['macd']['label'] if d.get('macd') else 'n/a')}")
-        L.append("VWAP: " + (esc(rel(d['vwap'])) if d.get("vwap") else "n/a (daily VWAP only on intraday timeframes)"))
-
-        L += ["", B("4. Support and resistance")]
-        for lvl, n_ in an["supports"][:1 if compact else 2]:
-            L.append(f"Support: {esc(_dist(lvl, price))} · {n_} touch{'es' if n_ != 1 else ''}")
-        for lvl, n_ in an["resistances"][:1 if compact else 2]:
-            L.append(f"Resistance: {esc(_dist(lvl, price))} · {n_} touch{'es' if n_ != 1 else ''}")
+        vr = d.get("vol_ratio")
+        L += [f"- RSI: {_num(d.get('rsi'))}",
+              f"- EMA 20 / 50 / 200: {esc(fmt_price(d.get('ema20')) if d.get('ema20') else 'n/a')} / "
+              f"{esc(fmt_price(d.get('ema50')) if d.get('ema50') else 'n/a')} / "
+              f"{esc(fmt_price(d.get('ema200')) if d.get('ema200') else 'n/a')}  (price "
+              f"{'above' if price > (d.get('ema50') or price) else 'below'} EMA 50)",
+              f"- MACD: {esc(d['macd']['label'] if d.get('macd') else 'n/a')}",
+              f"- ADX: {_num(d.get('adx'))}",
+              f"- Volume: {'n/a' if vr is None else format(vr, '.1f') + 'x average'}",
+              "- VWAP position: " + (esc(rel(d['vwap'])) if d.get("vwap") else "n/a (daily VWAP is intraday only)"), "",
+              B("4. Support and resistance")]
+        for lvl, _n in an["supports"][:1 if compact else 2]:
+            L.append(f"- Support: {esc(fmt_price(lvl))} ({(lvl - price) / price * 100:+.1f}%)")
+        for lvl, _n in an["resistances"][:1 if compact else 2]:
+            L.append(f"- Resistance: {esc(fmt_price(lvl))} ({(lvl - price) / price * 100:+.1f}%)")
         if not an["supports"] and not an["resistances"]:
-            L.append("No clear levels (price at range extreme)")
-        L.append(f"Confirmation: {esc((d.get('bs') or {}).get('text', 'n/a'))}")
+            L.append("- No clear levels (price at range extreme)")
+        L.append(f"- Breakout / retest confirmation: {esc((d.get('bs') or {}).get('text', 'n/a'))}")
+    else:
+        L += ["- n/a (not enough candle data)", "", B("4. Support and resistance"), "- n/a"]
+    L.append("")
 
-    L += ["", B("5. Trade plan")]
-    p = r["plan"]
+    L.append(B("5. Trade plan"))
     if p:
-        sd = "LONG" if p["dir"] > 0 else "SHORT"
-        L.append(f"{sd} · Entry {esc(fmt_price(p['entry']))} (market; or wait for a small pullback)")
-        L.append(f"Stop-loss: {esc(fmt_price(p['stop']))} ({-p['stop_pct'] * p['dir']:+.1f}%)")
-        L.append(f"Take-profit 1: {esc(fmt_price(p['tp1']))} ({p['rr1']}R) · take-profit 2: {esc(fmt_price(p['tp2']))} ({p['rr2']}R)")
+        L += [f"{'LONG' if p['dir'] > 0 else 'SHORT'} setup",
+              f"Entry: {esc(fmt_price(p['entry']))}",
+              f"Stop-loss: {esc(fmt_price(p['stop']))}",
+              f"Take-profit 1: {esc(fmt_price(p['tp1']))}",
+              f"Take-profit 2: {esc(fmt_price(p['tp2']))}"]
     elif act == "SELL" and mode == "spot":
-        L.append("Spot mode has no short trade. If you hold it, consider reducing or exiting; if not, stay out.")
+        L.append("Spot mode: no short trade. If you hold it consider reducing or exiting, otherwise stay out.")
         if an:
-            L.append(f"Bearish confirmed while price stays below {esc(fmt_price(an['bear']['invalid']))}.")
+            L.append(f"Bearish stays valid while price is below {esc(fmt_price(an['bear']['invalid']))}.")
     else:
-        L.append("No trade plan - " + ("blocked by safety filter." if act == "NO TRADE" else "waiting for confirmation."))
+        L.append("No trade plan - " + ("a safety filter blocks entry." if act == "NO TRADE" else "waiting for confirmation."))
+    L.append("")
 
-    L += ["", B("6. Risk analysis")]
+    L.append(B("6. Risk analysis"))
     if p:
-        L.append(f"Risk/reward: {p['rr1']}:1 to TP1 ({p['net_rr1']:.2f} after fees), {p['rr2']}:1 to TP2")
-        L.append(f"Position size: {p['qty']:.6g} {esc(base)} (~{esc(_fmt_usd(p['notional']))})" + (" · capped by max size" if p["capped"] else ""))
-        L.append(f"Estimated fees (round trip): ${p['fees']:.2f} | Risk: ${p['risk_usd']:.2f} = {p['risk_acct_pct']:.2f}% of account")
+        L += [f"- Risk-to-reward ratio: {p['rr1']}:1 to TP1 ({p['net_rr1']:.2f} after fees), {p['rr2']}:1 to TP2",
+              f"- Position size: {p['qty']:.6g} {esc(base)} (~{esc(_fmt_usd(p['notional']))})" + (" - capped by max size" if p["capped"] else ""),
+              f"- Estimated fees: ${p['fees']:.2f} (round trip)",
+              f"- Risk percentage of account: {p['risk_acct_pct']:.2f}% (${p['risk_usd']:.2f})"]
     else:
-        L.append("n/a - no active plan")
+        L.append("- n/a - no active plan")
+    L.append("")
 
-    L += ["", B("7. News and market conditions")]
-    nw = d.get("news") or {}
+    nw, dv = d.get("news") or {}, d.get("derivs") or {}
+    L.append(B("7. News and market conditions"))
     if nw.get("none"):
-        L.append("No coin-specific headlines found (not counted as positive or negative)")
+        L.append("- Coin-specific news: none found (not counted as positive or negative)")
     else:
-        for tg_ in nw.get("pos", []):
-            L.append(f"🟢 Headline catalyst: {esc(tg_)}")
-        for tg_ in nw.get("neg", []):
-            L.append(f"🔴 Negative headline: {esc(tg_)}")
+        L += [f"- Positive news: {esc(x)}" for x in nw.get("pos", [])] + [f"- Negative news: {esc(x)}" for x in nw.get("neg", [])]
+        if not nw.get("pos") and not nw.get("neg"):
+            L.append("- Coin-specific news: nothing market-moving")
         if nw.get("rumor"):
-            L.append("⚠️ Headline wording is rumor / unconfirmed")
+            L.append("- Warning: headline wording is rumor / unconfirmed")
         if not compact:
-            for h in nw.get("headlines", []):
-                L.append(f"• {esc(h)}")
-    L.append("Economic event: " + (f"⚠️ {esc(d['event'][0])} in ~{max(d['event'][1], 0)} min" if d.get("event")
-                                    else "none in the next 45 min"))
-    dv = d.get("derivs") or {}
+            L += [f"  • {esc(h)}" for h in nw.get("headlines", [])]
+    L.append("- Important economic events: " + (f"{esc(d['event'][0])} in ~{max(d['event'][1], 0)} min" if d.get("event")
+                                                else "none in the next 45 min"))
     if dv.get("funding") is None and dv.get("oi_change_24h") is None:
-        L.append("Funding / open interest: not available for this coin")
+        L.append("- Funding rate and open interest: not available for this coin")
     else:
-        L.append(f"Funding: {'n/a' if dv.get('funding') is None else format(dv['funding'] * 100, '+.3f') + '%'}"
+        L.append(f"- Funding rate: {'n/a' if dv.get('funding') is None else format(dv['funding'] * 100, '+.3f') + '%'}"
                  f" | Open interest 24h: {esc(fmt_pct(dv.get('oi_change_24h'), 1))}")
+    L.append("")
 
-    L += ["", B(f"Decision: {act}")]
+    L.append(B(f"Why: {act}"))
     if r["blockers"]:
-        L += ["⛔ " + esc(x) for x in r["blockers"][:3 if compact else 5]]
+        L += ["- " + esc(x) for x in r["blockers"][:3 if compact else 5]]
     elif act in ("BUY", "SELL"):
-        L += ["✅ " + esc(x) for x in (r["pro"] if act == "BUY" else r["con"])[:3 if compact else 4]]
-        L.append("Risks: " + esc("; ".join(x for x in (r["con"] if act == "BUY" else r["pro"])[:2]) or "none flagged"))
+        L += ["- " + esc(x) for x in (r["pro"] if act == "BUY" else r["con"])[:3 if compact else 4]]
+        L.append("- Risks: " + esc("; ".join((r["con"] if act == "BUY" else r["pro"])[:2]) or "none flagged"))
     else:
-        L += ["⏳ Wait for: " + esc(x) for x in r["needs"][:3 if compact else 5]]
+        L += ["- Waiting for: " + esc(x) for x in r["needs"][:3 if compact else 5]]
     if r["missing"]:
-        L.append("ℹ️ Missing data (counted as neutral): " + esc(", ".join(r["missing"][:4])))
-    label = "Overall confidence" if act in ("BUY", "SELL") else "Setup strength"
-    val = r["confidence"] if act != "NO TRADE" else "-"
-    L += ["", f"<b>{label}: {val}{'/100' if act != 'NO TRADE' else ''}</b> (score {r['score']:+.0f})",
-          "<i>Information only - no orders are placed. Not financial advice; use the stop-loss.</i>"]
+        L.append("- Missing data (counted as neutral): " + esc(", ".join(r["missing"][:4])))
+    L.append("")
+    if act == "NO TRADE":
+        L.append("<b>Overall confidence</b>\nn/a (blocked)")
+    else:
+        L.append(f"<b>{'Overall confidence' if act in ('BUY', 'SELL') else 'Setup strength'}</b>\n{r['confidence']}/100")
+    L += ["", "<i>Information only - no orders are placed. Not financial advice.</i>"]
     return "\n".join(L)
 
 
@@ -6585,7 +6595,7 @@ def coins_menu_text(state):
     c = card_cfg(state)
     every = "off" if not c["every"] else (f"{c['every']} min" if c["every"] < 60 else f"{c['every'] // 60} h")
     return "\n".join([
-        B("🪙 Select coins to monitor") + f"  ({len(c['coins'])}/{CARD_MAX_COINS} selected)",
+        B("Select coins to monitor") + f"\n{len(c['coins'])} selected (max {CARD_MAX_COINS})",
         "Tap a coin to select / unselect it.", "",
         f"Selected: {esc(', '.join(c['coins']) or 'none')}",
         f"Timeframe: <b>{esc(c['tf'].upper())}</b> | Auto-check every: <b>{esc(every)}</b> | "
@@ -6604,7 +6614,8 @@ def coins_keyboard(state):
     rows.append([{"text": ("• " if t == c["tf"] else "") + t.upper(), "callback_data": f"cc:tf:{t}"} for t in CARD_TFS])
     rows.append([{"text": ("• " if m == c["every"] else "") + ("Off" if m == 0 else f"{m}m" if m < 60 else f"{m // 60}h"),
                   "callback_data": f"cc:ev:{m}"} for m in CARD_INTERVALS])
-    rows.append([{"text": "📊 Analyse selected", "callback_data": "cc:run"}, {"text": "🧹 Clear", "callback_data": "cc:clear"}])
+    rows.append([{"text": "📊 Analyse selected", "callback_data": "cc:run"}, {"text": "🧹 Clear", "callback_data": "cc:clear"},
+                 {"text": "📋 Copy selected", "callback_data": "cc:copy"}])
     rows.append([{"text": "Mode: " + ("Spot" if c["mode"] == "spot" else "Futures"), "callback_data": "cc:mode"},
                  {"text": "🔔 Alerts " + ("ON" if c["alerts"] else "OFF"), "callback_data": "cc:al"},
                  {"text": "📈 Record", "callback_data": "cc:stats"}])
@@ -6752,6 +6763,8 @@ def handle_coins_callback(state, cq):
         show_coins_menu(state, mid)
     elif act == "menu":
         show_coins_menu(state)
+    elif act == "copy":
+        tg_send_html("<code>" + esc(", ".join(f"{b}/USDT" for b in c["coins"]) or "none selected") + "</code>", None, level="low")
     elif act == "run":
         cmd_cards(state, [])
     elif act == "stats":
